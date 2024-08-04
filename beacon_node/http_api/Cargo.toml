@@ -6,7 +6,6 @@ edition = { workspace = true }
 autotests = false                               # using a single test binary compiles faster
 
 [dependencies]
-warp = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }

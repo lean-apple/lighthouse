@@ -1,6 +1,6 @@
 use super::task_spawner::{Priority, TaskSpawner};
 use axum::extract::{Query, RawQuery};
-use axum::http::{HeaderMap, HeaderValue};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::{extract::Path, extract::Request, extract::State, Json};
@@ -147,26 +147,32 @@ pub async fn get_beacon_blocks_root<T: BeaconChainTypes>(
     Path(block_id): Path<String>,
 ) -> Result<Json<ExecutionOptimisticFinalizedResponse<RootData>>, HandlerError> {
     let chain = chain_filter(&ctx)?;
-    let block_id = BlockId::from_str(&block_id)?;
-    let (block_root, execution_optimistic, finalized) = block_id.root(&chain)?;
-    Ok(
+    let block_id = BlockId::from_str(&block_id)
+        .map_err(|e| HandlerError::BadRequest(format!("invalid block ID: {:?}", e)))?;
+    let (block_root, execution_optimistic, finalized) = block_id
+        .root(&chain)
+        .map_err(|e| HandlerError::ServerError(format!("failed to get block root: {:?}", e)))?;
+    Ok(Json(
         api_types::GenericResponse::from(api_types::RootData::from(block_root))
             .add_execution_optimistic_finalized(execution_optimistic, finalized),
-    )
-    .map(Json)
+    ))
 }
 
 /// GET beacon/states/{state_id}/root
 pub async fn get_beacon_state_root<T: BeaconChainTypes>(
     State(ctx): State<Arc<Context<T>>>,
     Path(state_id): Path<String>,
-) -> Result<Json<ExecutionOptimisticFinalizedResponse<RootData>>, HandlerError> {
+) -> Result<Json<ExecutionOptimisticFinalizedResponse<api_types::RootData>>, HandlerError> {
     let chain = chain_filter(&ctx)?;
-    let state_id = StateId::from_str(&state_id)?;
-    let (root, execution_optimistic, finalized) = state_id.root(&chain)?;
-    Ok(GenericResponse::from(api_types::RootData::from(root)))
-        .map(|resp| resp.add_execution_optimistic_finalized(execution_optimistic, finalized))
-        .map(Json)
+    let state_id = StateId::from_str(&state_id)
+        .map_err(|e| HandlerError::BadRequest(format!("invalid state ID: {:?}", e)))?;
+    let (root, execution_optimistic, finalized) = state_id
+        .root(&chain)
+        .map_err(|e| HandlerError::ServerError(format!("failed to get state root: {:?}", e)))?;
+    Ok(Json(
+        GenericResponse::from(api_types::RootData::from(root))
+            .add_execution_optimistic_finalized(execution_optimistic, finalized),
+    ))
 }
 
 /// GET beacon/states/{state_id}/fork
@@ -175,12 +181,15 @@ pub async fn get_beacon_state_fork<T: BeaconChainTypes>(
     Path(state_id): Path<String>,
 ) -> Result<Json<ExecutionOptimisticFinalizedResponse<api_types::Fork>>, HandlerError> {
     let chain = chain_filter(&ctx)?;
-    let state_id = StateId::from_str(&state_id)?;
-    let (fork, execution_optimistic, finalized) =
-        state_id.fork_and_execution_optimistic_and_finalized(&chain)?;
-    Ok(GenericResponse::from(api_types::Fork::from(fork)))
-        .map(|resp| resp.add_execution_optimistic_finalized(execution_optimistic, finalized))
-        .map(Json)
+    let state_id = StateId::from_str(&state_id)
+        .map_err(|e| HandlerError::BadRequest(format!("invalid state ID: {:?}", e)))?;
+    let (fork, execution_optimistic, finalized) = state_id
+        .fork_and_execution_optimistic_and_finalized(&chain)
+        .map_err(|e| HandlerError::ServerError(format!("failed to get state fork: {:?}", e)))?;
+    Ok(Json(
+        GenericResponse::from(api_types::Fork::from(fork))
+            .add_execution_optimistic_finalized(execution_optimistic, finalized),
+    ))
 }
 
 /// GET beacon/states/{state_id}/finality_checkpoints
@@ -192,7 +201,8 @@ pub async fn get_beacon_state_finality_checkpoints<T: BeaconChainTypes>(
     HandlerError,
 > {
     let chain = chain_filter(&ctx)?;
-    let state_id = StateId::from_str(&state_id)?;
+    let state_id = StateId::from_str(&state_id)
+        .map_err(|e| HandlerError::BadRequest(format!("invalid state ID: {:?}", e)))?;
     let (data, execution_optimistic, finalized) = state_id
         .map_state_and_execution_optimistic_and_finalized(
             &chain,
@@ -207,13 +217,15 @@ pub async fn get_beacon_state_finality_checkpoints<T: BeaconChainTypes>(
                     finalized,
                 ))
             },
-        )?;
-    Ok(api_types::ExecutionOptimisticFinalizedResponse {
+        )
+        .map_err(|e| {
+            HandlerError::ServerError(format!("failed to get finality checkpoints: {:?}", e))
+        })?;
+    Ok(Json(ExecutionOptimisticFinalizedResponse {
         data,
         execution_optimistic: Some(execution_optimistic),
         finalized: Some(finalized),
-    })
-    .map(Json)
+    }))
 }
 
 /// Get sse events
@@ -226,7 +238,7 @@ pub async fn get_events<T: BeaconChainTypes>(
         dbg!(&query_str);
         let event_query: api_types::EventQuery =
             serde_array_query::from_str(&query_str).map_err(|e| {
-                HandlerError::Other(format!(
+                HandlerError::BadRequest(format!(
                     "Failed to parse query string: Query string: {} error: {:?}",
                     query_str, e
                 ))
@@ -294,9 +306,9 @@ pub async fn get_events<T: BeaconChainTypes>(
             );
         }
     } else {
-        return Err(HandlerError::Warp(warp_utils::reject::custom_server_error(
+        return Err(HandlerError::ServerError(
             "event handler was not initialized".to_string(),
-        )));
+        ));
     }
 
     let s = futures::stream::select_all(receivers);
@@ -310,26 +322,30 @@ pub async fn get_beacon_state_validator_balances<T: BeaconChainTypes>(
     RawQuery(query): RawQuery, // Should probably have a cleaner solution for this
 ) -> Result<Json<ExecutionOptimisticFinalizedResponse<Vec<ValidatorBalanceData>>>, HandlerError> {
     let chain = chain_filter(&ctx)?;
-    let state_id = StateId::from_str(&state_id)?;
+    let state_id = StateId::from_str(&state_id)
+        .map_err(|e| HandlerError::BadRequest(format!("invalid state ID: {:?}", e)))?;
+
     let validator_queries = if let Some(query_str) = query {
-        let validator_queies: ValidatorBalancesQuery = serde_array_query::from_str(&query_str)
+        let validator_queries: ValidatorBalancesQuery = serde_array_query::from_str(&query_str)
             .map_err(|e| {
-                HandlerError::Other(format!(
-                    "Failed to parse query string: Query string: {} error: {:?}",
+                HandlerError::BadRequest(format!(
+                    "failed to parse query string: Query string: {} error: {:?}",
                     query_str, e
                 ))
             })?;
-        validator_queies.id
+        validator_queries.id
     } else {
         None
     };
-    crate::validators::get_beacon_state_validator_balances(
+
+    let response = crate::validators::get_beacon_state_validator_balances(
         state_id,
         chain,
         validator_queries.as_deref(),
     )
-    .map_err(HandlerError::Warp)
-    .map(Json)
+    .map_err(|e| HandlerError::ServerError(format!("failed to get validator balances: {:?}", e)))?;
+
+    Ok(Json(response))
 }
 
 /// GET beacon/states/{state_id}/validators/{validator_id}
@@ -338,7 +354,8 @@ pub async fn get_beacon_state_validators_id<T: BeaconChainTypes>(
     Path((state_id, validator_id)): Path<(String, ValidatorId)>,
 ) -> Result<Json<ExecutionOptimisticFinalizedResponse<ValidatorData>>, HandlerError> {
     let chain = chain_filter(&ctx)?;
-    let state_id = StateId::from_str(&state_id)?;
+    let state_id = StateId::from_str(&state_id)
+        .map_err(|e| HandlerError::BadRequest(format!("invalid state ID: {:?}", e)))?;
 
     let (data, execution_optimistic, finalized) = state_id
         .map_state_and_execution_optimistic_and_finalized(
@@ -347,52 +364,46 @@ pub async fn get_beacon_state_validators_id<T: BeaconChainTypes>(
                 let index_opt = match &validator_id {
                     ValidatorId::PublicKey(pubkey) => {
                         pubkey_to_validator_index(&chain, state, pubkey).map_err(|e| {
-                            warp_utils::reject::custom_not_found(format!(
-                                "unable to access pubkey cache: {e:?}",
+                            HandlerError::NotFound(format!(
+                                "unable to access pubkey cache: {:?}",
+                                e
                             ))
                         })?
                     }
                     ValidatorId::Index(index) => Some(*index as usize),
                 };
 
-                Ok((
-                    index_opt
-                        .and_then(|index| {
-                            let validator = state.validators().get(index)?;
-                            let balance = *state.balances().get(index)?;
-                            let epoch = state.current_epoch();
-                            let far_future_epoch = chain.spec.far_future_epoch;
+                let validator_data = index_opt
+                    .and_then(|index| {
+                        let validator = state.validators().get(index)?;
+                        let balance = *state.balances().get(index)?;
+                        let epoch = state.current_epoch();
+                        let far_future_epoch = chain.spec.far_future_epoch;
 
-                            Some(api_types::ValidatorData {
-                                index: index as u64,
-                                balance,
-                                status: api_types::ValidatorStatus::from_validator(
-                                    validator,
-                                    epoch,
-                                    far_future_epoch,
-                                ),
-                                validator: validator.clone(),
-                            })
+                        Some(api_types::ValidatorData {
+                            index: index as u64,
+                            balance,
+                            status: api_types::ValidatorStatus::from_validator(
+                                validator,
+                                epoch,
+                                far_future_epoch,
+                            ),
+                            validator: validator.clone(),
                         })
-                        .ok_or_else(|| {
-                            warp_utils::reject::custom_not_found(format!(
-                                "unknown validator: {}",
-                                validator_id
-                            ))
-                        })?,
-                    execution_optimistic,
-                    finalized,
-                ))
+                    })
+                    .ok_or_else(|| {
+                        HandlerError::NotFound(format!("unknown validator: {}", validator_id))
+                    })?;
+                Ok((validator_data, execution_optimistic, finalized))
             },
         )
-        .map_err(HandlerError::Warp)?;
+        .map_err(|e| HandlerError::ServerError(format!("failed to get validator data: {:?}", e)))?;
 
-    Ok(api_types::ExecutionOptimisticFinalizedResponse {
+    Ok(Json(api_types::ExecutionOptimisticFinalizedResponse {
         data,
         execution_optimistic: Some(execution_optimistic),
         finalized: Some(finalized),
-    })
-    .map(Json)
+    }))
 }
 
 /// TODO: investigate merging ssz and json handlers
@@ -615,11 +626,10 @@ pub async fn post_beacon_pool_attestations<T: BeaconChainTypes>(
     if failures.is_empty() {
         Ok(())
     } else {
-        Err(warp_utils::reject::indexed_bad_request(
-            "error processing attestations".to_string(),
-            failures,
-        ))
-        .map_err(HandlerError::Warp)
+        Err(HandlerError::BadRequest(format!(
+            "error processing attestations: {:?}",
+            failures
+        )))
     }
 }
 
@@ -651,18 +661,19 @@ pub async fn get_node_syncing<T: BeaconChainTypes>(
     };
 
     let head_slot = chain.canonical_head.cached_head().head_slot();
-    let current_slot = chain.slot_clock.now_or_genesis().ok_or_else(|| {
-        warp_utils::reject::custom_server_error("Unable to read slot clock".into())
-    })?;
+    let current_slot = chain
+        .slot_clock
+        .now_or_genesis()
+        .ok_or_else(|| HandlerError::ServerError("Unable to read slot clock".to_string()))?;
 
     // Taking advantage of saturating subtraction on slot.
     let sync_distance = current_slot - head_slot;
 
     let is_optimistic = chain
         .is_optimistic_or_invalid_head()
-        .map_err(warp_utils::reject::beacon_chain_error)?;
+        .map_err(|e| HandlerError::BeaconChainError(format!("Beacon chain error: {:?}", e)))?;
 
-    let syncing_data = api_types::SyncingData {
+    let syncing_data = SyncingData {
         is_syncing: network_globals.sync_state.read().is_syncing(),
         is_optimistic: Some(is_optimistic),
         el_offline: Some(el_offline),
@@ -670,7 +681,7 @@ pub async fn get_node_syncing<T: BeaconChainTypes>(
         sync_distance,
     };
 
-    Ok(api_types::GenericResponse::from(syncing_data)).map(Json)
+    Ok(Json(GenericResponse::from(syncing_data)))
 }
 
 /// GET config/spec
@@ -700,10 +711,9 @@ pub async fn post_validator_duties_attester<T: BeaconChainTypes>(
 ) -> Result<Json<api_types::DutiesResponse<Vec<api_types::AttesterData>>>, HandlerError> {
     let chain = chain_filter(&ctx)?;
     attester_duties::attester_duties(epoch, &indices.0, &chain)
-        .map_err(HandlerError::Warp)
+        .map_err(|e| HandlerError::Other(format!("Attester duties error: {:?}", e)))
         .map(Json)
 }
-
 /// GET validator/duties/proposer/{epoch}
 pub async fn get_validator_duties_proposer<T: BeaconChainTypes>(
     State(ctx): State<Arc<Context<T>>>,
@@ -712,7 +722,7 @@ pub async fn get_validator_duties_proposer<T: BeaconChainTypes>(
     let chain = chain_filter(&ctx)?;
     let log = ctx.log.clone();
     proposer_duties::proposer_duties(epoch, &chain, &log)
-        .map_err(HandlerError::Warp)
+        .map_err(|e| HandlerError::Other(format!("Proposer duties error: {:?}", e)))
         .map(Json)
 }
 
@@ -724,7 +734,7 @@ pub async fn post_validator_duties_sync<T: BeaconChainTypes>(
 ) -> Result<Json<api_types::ExecutionOptimisticResponse<Vec<SyncDuty>>>, HandlerError> {
     let chain = chain_filter(&ctx)?;
     sync_committees::sync_committee_duties(epoch, &indices.0, &chain)
-        .map_err(HandlerError::Warp)
+        .map_err(|e| HandlerError::Other(format!("Validator duties error: {:?}", e)))
         .map(Json)
 }
 
@@ -733,14 +743,16 @@ async fn produce_block<T: BeaconChainTypes>(
     slot: Slot,
     query: api_types::ValidatorBlocksQuery,
     version: BlockProductionVersion,
-) -> Result<(BeaconBlockResponseWrapper<T::EthSpec>, ForkName), warp::Rejection> {
+) -> Result<(BeaconBlockResponseWrapper<T::EthSpec>, ForkName), HandlerError> {
     let randao_reveal = query.randao_reveal.decompress().map_err(|e| {
-        warp_utils::reject::custom_bad_request(format!(
-            "randao reveal is not a valid BLS signature: {:?}",
+        HandlerError::InvalidRandaoReveal(format!(
+            "RANDAO reveal is not a valid BLS signature: {:?}",
             e
         ))
     })?;
-    let randao_verification = get_randao_verification(&query, randao_reveal.is_infinity())?;
+
+    let randao_verification = get_randao_verification(&query, randao_reveal.is_infinity())
+        .map_err(|e| HandlerError::BadRequest(format!("Invalid randao verification: {:?}", e)))?;
 
     let block_response = chain
         .produce_block_with_verification(
@@ -752,10 +764,12 @@ async fn produce_block<T: BeaconChainTypes>(
             version,
         )
         .await
-        .map_err(warp_utils::reject::block_production_error)?;
+        .map_err(|e| HandlerError::BlockProductionError(format!("{:?}", e)))?;
+
     let fork_name = block_response
         .fork_name(&chain.spec)
-        .map_err(|e| inconsistent_fork_rejection(e))?;
+        .map_err(|e| HandlerError::InconsistentFork(format!("{:?}", e)))?; // TODO: reuse inconsistent_fork_rejection
+
     Ok((block_response, fork_name))
 }
 
@@ -765,44 +779,49 @@ pub async fn get_validator_blocks_v2<T: BeaconChainTypes>(
     Path(slot): Path<Slot>,
     header_map: HeaderMap,
     Query(query): Query<ValidatorBlocksQuery>,
-) -> Result<Response, HandlerError> {
+) -> Result<impl IntoResponse, HandlerError> {
     let chain = chain_filter(&ctx)?;
-    let accept_header = if let Some(val) = header_map.get("accept") {
-        api_types::Accept::from_str(val.to_str().map_err(|_| HandlerError::BadRequest)?).ok()
-    } else {
-        None
-    };
-    let (block_response, fork_name) =
-        produce_block(chain, slot, query, BlockProductionVersion::FullV2)
-            .await
-            .map_err(|e| HandlerError::Warp(e))?;
+    let accept_header = header_map
+        .get("accept")
+        .and_then(|val| val.to_str().ok())
+        .and_then(|val| api_types::Accept::from_str(val).ok());
 
-    let block_contents = build_block_contents::build_block_contents(fork_name, block_response)?;
+    let (block_response, fork_name) =
+        produce_block(chain, slot, query, BlockProductionVersion::FullV2).await?;
+
+    let block_contents = build_block_contents::build_block_contents(fork_name, block_response)
+        .map_err(|e| HandlerError::Other(format!("failed to build block contents: {:?}", e)));
+
     match accept_header {
-        Some(api_types::Accept::Ssz) => Response::builder()
-            .status(200)
-            .header(CONTENT_TYPE_HEADER, SSZ_CONTENT_TYPE_HEADER)
-            .header(CONSENSUS_VERSION_HEADER, fork_name.to_string())
-            .body(block_contents.as_ssz_bytes().into())
+        Some(api_types::Accept::Ssz) => {
+            let body = block_contents.as_ssz_bytes();
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE_HEADER, SSZ_CONTENT_TYPE_HEADER)
+                .header(CONSENSUS_VERSION_HEADER, fork_name.to_string())
+                .body(body)
+                .map_err(|e| {
+                    HandlerError::ServerError(format!("failed to create SSZ response: {}", e))
+                })?)
+        }
+        _ => {
+            let json_response = fork_versioned_response(
+                EndpointVersion(2),
+                fork_name,
+                block_contents,
+            )
             .map_err(|e| {
-                HandlerError::Warp(warp_utils::reject::custom_server_error(format!(
-                    "failed to create response: {}",
-                    e
-                )))
-            }),
-        _ => Ok(Json(
-            fork_versioned_response(EndpointVersion(2), fork_name, block_contents)
-                .map_err(HandlerError::Warp)?,
-        )
-        .into_response())
-        .map(|mut resp| {
-            let headers = resp.headers_mut();
-            headers.insert(
+                HandlerError::ServerError(format!("failed to create JSON response: {:?}", e))
+            })?;
+
+            let mut response = Json(json_response).into_response();
+            response.headers_mut().insert(
                 CONSENSUS_VERSION_HEADER,
-                HeaderValue::from_str(&fork_name.to_string()).expect("valid header value"),
+                HeaderValue::from_str(&fork_name.to_string())
+                    .map_err(|_| HandlerError::ServerError("invalid header value".to_string()))?,
             );
-            resp
-        }),
+            Ok(response)
+        }
     }
 }
 
@@ -812,17 +831,15 @@ pub async fn get_validator_blocks_v3<T: BeaconChainTypes>(
     Path(slot): Path<Slot>,
     header_map: HeaderMap,
     Query(query): Query<ValidatorBlocksQuery>,
-) -> Result<Response, HandlerError> {
+) -> Result<impl IntoResponse, HandlerError> {
     let chain = chain_filter(&ctx)?;
-    let accept_header = if let Some(val) = header_map.get("accept") {
-        api_types::Accept::from_str(val.to_str().map_err(|_| HandlerError::BadRequest)?).ok()
-    } else {
-        None
-    };
+    let accept_header = header_map
+        .get("accept")
+        .and_then(|val| val.to_str().ok())
+        .and_then(|val| api_types::Accept::from_str(val).ok());
+
     let (block_response, fork_name) =
-        produce_block(chain, slot, query, BlockProductionVersion::FullV2)
-            .await
-            .map_err(HandlerError::Warp)?;
+        produce_block(chain, slot, query, BlockProductionVersion::FullV2).await?;
 
     let execution_payload_value = block_response.execution_payload_value();
     let consensus_block_value = block_response.consensus_block_value_wei();
@@ -835,61 +852,70 @@ pub async fn get_validator_blocks_v3<T: BeaconChainTypes>(
         consensus_block_value,
     };
 
-    let block_contents = build_block_contents::build_block_contents(fork_name, block_response)?;
+    let block_contents = build_block_contents::build_block_contents(fork_name, block_response)
+        .map_err(|e| HandlerError::Other(format!("failed to build block contents: {:?}", e)))?;
 
     match accept_header {
-        Some(api_types::Accept::Ssz) => Response::builder()
-            .status(200)
-            .header(CONTENT_TYPE_HEADER, SSZ_CONTENT_TYPE_HEADER)
-            .header(CONSENSUS_VERSION_HEADER, fork_name.to_string())
-            .header(
-                EXECUTION_PAYLOAD_BLINDED_HEADER,
-                execution_payload_blinded.to_string(),
-            )
-            .header(
-                EXECUTION_PAYLOAD_VALUE_HEADER,
-                execution_payload_value.to_string(),
-            )
-            .header(
-                CONSENSUS_BLOCK_VALUE_HEADER,
-                consensus_block_value.to_string(),
-            )
-            .body(block_contents.as_ssz_bytes().into())
-            .map_err(|e| {
-                HandlerError::Warp(warp_utils::reject::custom_server_error(format!(
-                    "failed to create response: {}",
-                    e
-                )))
-            }),
-        _ => Ok(Json(ForkVersionedResponse {
-            version: Some(fork_name),
-            metadata,
-            data: block_contents,
-        })
-        .into_response())
-        .map(|mut resp| {
-            let headers = resp.headers_mut();
+        Some(api_types::Accept::Ssz) => {
+            let body = block_contents.as_ssz_bytes();
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE_HEADER, SSZ_CONTENT_TYPE_HEADER)
+                .header(CONSENSUS_VERSION_HEADER, fork_name.to_string())
+                .header(
+                    EXECUTION_PAYLOAD_BLINDED_HEADER,
+                    execution_payload_blinded.to_string(),
+                )
+                .header(
+                    EXECUTION_PAYLOAD_VALUE_HEADER,
+                    execution_payload_value.to_string(),
+                )
+                .header(
+                    CONSENSUS_BLOCK_VALUE_HEADER,
+                    consensus_block_value.to_string(),
+                )
+                .body(body)
+                .map_err(|e| {
+                    HandlerError::ServerError(format!("failed to create SSZ response: {}", e))
+                })?)
+        }
+        _ => {
+            let json_response = ForkVersionedResponse {
+                version: Some(fork_name),
+                metadata,
+                data: block_contents,
+            };
+
+            let mut response = Json(json_response).into_response();
+            let headers = response.headers_mut();
             headers.insert(
                 CONSENSUS_VERSION_HEADER,
-                HeaderValue::from_str(&fork_name.to_string()).expect("valid header value"),
+                HeaderValue::from_str(&fork_name.to_string()).map_err(|_| {
+                    HandlerError::Other("Invalid consensus version header value".to_string())
+                })?,
             );
             headers.insert(
                 EXECUTION_PAYLOAD_BLINDED_HEADER,
-                HeaderValue::from_str(&execution_payload_blinded.to_string())
-                    .expect("valid header value"),
+                HeaderValue::from_str(&execution_payload_blinded.to_string()).map_err(|_| {
+                    HandlerError::Other(
+                        "Invalid execution payload blinder header value".to_string(),
+                    )
+                })?,
             );
             headers.insert(
                 EXECUTION_PAYLOAD_VALUE_HEADER,
-                HeaderValue::from_str(&execution_payload_value.to_string())
-                    .expect("valid header value"),
+                HeaderValue::from_str(&execution_payload_value.to_string()).map_err(|_| {
+                    HandlerError::Other("Invalid execution payload header value".to_string())
+                })?,
             );
             headers.insert(
                 CONSENSUS_BLOCK_VALUE_HEADER,
-                HeaderValue::from_str(&consensus_block_value.to_string())
-                    .expect("valid header value"),
+                HeaderValue::from_str(&consensus_block_value.to_string()).map_err(|_| {
+                    HandlerError::Other("Invalid consensus block header value".to_string())
+                })?,
             );
-            resp
-        }),
+            Ok(response)
+        }
     }
 }
 
@@ -899,28 +925,27 @@ pub async fn get_validator_attestation_data<T: BeaconChainTypes>(
     Query(query): Query<ValidatorAttestationDataQuery>,
 ) -> Result<Json<GenericResponse<AttestationData>>, HandlerError> {
     let chain = chain_filter(&ctx)?;
-    let current_slot = chain
-        .slot()
-        .map_err(warp_utils::reject::beacon_chain_error)
-        .map_err(HandlerError::Warp)?;
+    let current_slot = chain.slot().map_err(|e| {
+        HandlerError::BeaconChainError(format!("Failed to get current slot: {:?}", e))
+    })?;
 
     // allow a tolerance of one slot to account for clock skew
     if query.slot > current_slot + 1 {
-        return Err(HandlerError::Warp(warp_utils::reject::custom_bad_request(
-            format!(
-                "request slot {} is more than one slot past the current slot {}",
-                query.slot, current_slot
-            ),
+        return Err(HandlerError::BadRequest(format!(
+            "Request slot {} is more than one slot past the current slot {}",
+            query.slot, current_slot
         )));
     }
 
-    chain
+    let attestation_data = chain
         .produce_unaggregated_attestation(query.slot, query.committee_index)
-        .map(|attestation| attestation.data().clone())
-        .map(api_types::GenericResponse::from)
-        .map(Json)
-        .map_err(warp_utils::reject::beacon_chain_error)
-        .map_err(HandlerError::Warp)
+        .map_err(|e| {
+            HandlerError::BeaconChainError(format!("Failed to produce attestation: {:?}", e))
+        })?
+        .data()
+        .clone();
+
+    Ok(Json(api_types::GenericResponse::from(attestation_data)))
 }
 
 /// GET validator/aggregate_attestation?slot,committee_index
@@ -929,20 +954,18 @@ pub async fn get_validator_aggregate_attestation<T: BeaconChainTypes>(
     Query(query): Query<ValidatorAggregateAttestationQuery>,
 ) -> Result<Json<GenericResponse<Attestation<T::EthSpec>>>, HandlerError> {
     let chain = chain_filter(&ctx)?;
-    chain
+
+    let aggregate = chain
         .get_pre_electra_aggregated_attestation_by_slot_and_root(
             query.slot,
             &query.attestation_data_root,
         )
-        .map_err(|e| {
-            warp_utils::reject::custom_bad_request(format!("unable to fetch aggregate: {:?}", e))
+        .map_err(|e: BeaconChainError| {
+            HandlerError::BadRequest(format!("unable to fetch aggregate: {:?}", e))
         })?
-        .map(api_types::GenericResponse::from)
-        .map(Json)
-        .ok_or_else(|| {
-            warp_utils::reject::custom_not_found("no matching aggregate found".to_string())
-        })
-        .map_err(HandlerError::Warp)
+        .ok_or_else(|| HandlerError::NotFound("no matching aggregate found".to_string()))?;
+
+    Ok(Json(GenericResponse::from(aggregate)))
 }
 
 /// POST validator/aggregate_and_proofs
@@ -1016,7 +1039,9 @@ pub async fn post_validator_aggregate_and_proofs<T: BeaconChainTypes>(
 
     // Publish aggregate attestations to the libp2p network
     if !messages.is_empty() {
-        publish_network_message(&network_tx, NetworkMessage::Publish { messages })?;
+        publish_network_message(&network_tx, NetworkMessage::Publish { messages }).map_err(
+            |e| HandlerError::Other(format!("failed to publish network message: {:?}", e)),
+        )?;
     }
 
     // Import aggregate attestations
@@ -1047,9 +1072,9 @@ pub async fn post_validator_aggregate_and_proofs<T: BeaconChainTypes>(
     }
 
     if !failures.is_empty() {
-        Err(HandlerError::Warp(warp_utils::reject::indexed_bad_request(
-            "error processing aggregate and proofs".to_string(),
-            failures,
+        Err(HandlerError::BadRequest(format!(
+            "error processing aggregate and proofs: {:?}",
+            failures
         )))
     } else {
         Ok(())
@@ -1089,9 +1114,9 @@ pub async fn post_validator_beacon_committee_subscriptions<T: BeaconChainTypes>(
             "info" => "the host may be overloaded or resource-constrained",
             "error" => ?e,
         );
-        return Err(HandlerError::Warp(warp_utils::reject::custom_server_error(
+        return Err(HandlerError::ServerError(
             "unable to queue subscription, host may be overloaded or shutting down".to_string(),
-        )));
+        ));
     }
 
     Ok(())
@@ -1122,9 +1147,9 @@ pub async fn post_validator_sync_committee_subscriptions<T: BeaconChainTypes>(
                 "info" => "the host may be overloaded or resource-constrained",
                 "error" => ?e
             );
-            return Err(HandlerError::Warp(warp_utils::reject::custom_server_error(
+            return Err(HandlerError::ServerError(
                 "unable to queue subscription, host may be overloaded or shutting down".to_string(),
-            )));
+            ));
         }
     }
 
@@ -1141,17 +1166,10 @@ pub async fn get_validator_sync_committee_contribution<T: BeaconChainTypes>(
     chain
         .get_aggregated_sync_committee_contribution(&sync_committee_data)
         .map_err(|e| {
-            warp_utils::reject::custom_bad_request(format!(
-                "unable to fetch sync contribution: {:?}",
-                e
-            ))
+            HandlerError::BadRequest(format!("Unable to fetch sync contribution: {:?}", e))
         })?
-        .map(api_types::GenericResponse::from)
-        .map(Json)
-        .ok_or_else(|| {
-            warp_utils::reject::custom_not_found("no matching sync contribution found".to_string())
-        })
-        .map_err(HandlerError::Warp)
+        .map(|contribution| Json(GenericResponse::from(contribution)))
+        .ok_or_else(|| HandlerError::NotFound("No matching sync contribution found".to_string()))
 }
 
 /// GET validator/contribution_and_proofs
@@ -1180,17 +1198,17 @@ pub async fn post_validator_prepare_beacon_proposer<T: BeaconChainTypes>(
     let chain = chain_filter(&ctx)?;
     let log = ctx.log.clone();
 
+    // TODO: Improve BeaconChainError specification
     let execution_layer = chain
         .execution_layer
         .as_ref()
-        .ok_or(BeaconChainError::ExecutionLayerMissing)
-        .map_err(warp_utils::reject::beacon_chain_error)
-        .map_err(HandlerError::Warp)?;
+        .ok_or(HandlerError::BeaconChainError(
+            "Execution layer missing".to_string(),
+        ))?;
 
-    let current_slot = chain
-        .slot()
-        .map_err(warp_utils::reject::beacon_chain_error)
-        .map_err(HandlerError::Warp)?;
+    let current_slot = chain.slot().map_err(|e| {
+        HandlerError::BeaconChainError(format!("Unable to get current slot: {:?}", e))
+    })?;
     let current_epoch = current_slot.epoch(T::EthSpec::slots_per_epoch());
 
     debug!(
@@ -1207,10 +1225,7 @@ pub async fn post_validator_prepare_beacon_proposer<T: BeaconChainTypes>(
         .prepare_beacon_proposer(current_slot)
         .await
         .map_err(|e| {
-            warp_utils::reject::custom_bad_request(format!(
-                "error updating proposer preparations: {:?}",
-                e
-            ))
+            HandlerError::BadRequest(format!("Error updating proposer preparations: {:?}", e))
         })?;
 
     Ok(())

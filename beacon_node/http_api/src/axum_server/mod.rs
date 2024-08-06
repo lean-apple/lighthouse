@@ -5,7 +5,7 @@ use axum::{
 };
 use beacon_chain::BeaconChainTypes;
 
-mod error;
+pub mod error;
 mod handler;
 mod task_spawner;
 use super::Context;

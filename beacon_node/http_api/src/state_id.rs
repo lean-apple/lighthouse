@@ -1,9 +1,10 @@
+use crate::axum_server::error::Error as AxumError;
 use crate::ExecutionOptimistic;
-use beacon_chain::{BeaconChain, BeaconChainError, BeaconChainTypes};
+use beacon_chain::{BeaconChain, BeaconChainTypes};
 use eth2::types::StateId as CoreStateId;
+use serde::Deserialize;
 use std::fmt;
 use std::str::FromStr;
-use serde::Deserialize;
 use types::{BeaconState, Checkpoint, EthSpec, Fork, Hash256, Slot};
 
 /// Wraps `eth2::types::StateId` and provides common state-access functionality. E.g., reading
@@ -23,13 +24,13 @@ impl StateId {
     pub fn root<T: BeaconChainTypes>(
         &self,
         chain: &BeaconChain<T>,
-    ) -> Result<(Hash256, ExecutionOptimistic, Finalized), warp::Rejection> {
+    ) -> Result<(Hash256, ExecutionOptimistic, Finalized), AxumError> {
         let (slot, execution_optimistic, finalized) = match &self.0 {
             CoreStateId::Head => {
                 let (cached_head, execution_status) = chain
                     .canonical_head
                     .head_and_execution_status()
-                    .map_err(warp_utils::reject::beacon_chain_error)?;
+                    .map_err(|e| AxumError::BeaconChainError(e.to_string()))?;
                 return Ok((
                     cached_head.head_state_root(),
                     execution_status.is_optimistic_or_invalid(),
@@ -55,7 +56,7 @@ impl StateId {
                 *slot,
                 chain
                     .is_optimistic_or_invalid_head()
-                    .map_err(warp_utils::reject::beacon_chain_error)?,
+                    .map_err(|e| AxumError::BeaconChainError(e.to_string()))?,
                 *slot
                     <= chain
                         .canonical_head
@@ -68,12 +69,11 @@ impl StateId {
                 if let Some(hot_summary) = chain
                     .store
                     .load_hot_state_summary(root)
-                    .map_err(BeaconChainError::DBError)
-                    .map_err(warp_utils::reject::beacon_chain_error)?
+                    .map_err(|e| AxumError::BeaconChainError(e.to_string()))?
                 {
                     let finalization_status = chain
                         .state_finalization_and_canonicity(root, hot_summary.slot)
-                        .map_err(warp_utils::reject::beacon_chain_error)?;
+                        .map_err(|e| AxumError::BeaconChainError(e.to_string()))?;
                     let finalized = finalization_status.is_finalized();
                     let fork_choice = chain.canonical_head.fork_choice_read_lock();
                     let execution_optimistic = if finalization_status.slot_is_finalized
@@ -92,15 +92,13 @@ impl StateId {
                         // it's safe to fallback to the optimistic status of the finalized block.
                         fork_choice
                             .is_optimistic_or_invalid_block(&hot_summary.latest_block_root)
-                            .map_err(BeaconChainError::ForkChoiceError)
-                            .map_err(warp_utils::reject::beacon_chain_error)?
+                            .map_err(|e| AxumError::BeaconChainError(e.to_string()))?
                     };
                     return Ok((*root, execution_optimistic, finalized));
                 } else if let Some(_cold_state_slot) = chain
                     .store
                     .load_cold_state_slot(root)
-                    .map_err(BeaconChainError::DBError)
-                    .map_err(warp_utils::reject::beacon_chain_error)?
+                    .map_err(|e| AxumError::BeaconChainError(e.to_string()))?
                 {
                     let fork_choice = chain.canonical_head.fork_choice_read_lock();
                     let finalized_root = fork_choice
@@ -109,11 +107,10 @@ impl StateId {
                         .root;
                     let execution_optimistic = fork_choice
                         .is_optimistic_or_invalid_block_no_fallback(&finalized_root)
-                        .map_err(BeaconChainError::ForkChoiceError)
-                        .map_err(warp_utils::reject::beacon_chain_error)?;
+                        .map_err(|e| AxumError::BeaconChainError(e.to_string()))?;
                     return Ok((*root, execution_optimistic, true));
                 } else {
-                    return Err(warp_utils::reject::custom_not_found(format!(
+                    return Err(AxumError::NotFound(format!(
                         "beacon state for state root {}",
                         root
                     )));
@@ -123,10 +120,8 @@ impl StateId {
 
         let root = chain
             .state_root_at_slot(slot)
-            .map_err(warp_utils::reject::beacon_chain_error)?
-            .ok_or_else(|| {
-                warp_utils::reject::custom_not_found(format!("beacon state at slot {}", slot))
-            })?;
+            .map_err(|e| AxumError::BeaconChainError(e.to_string()))?
+            .ok_or_else(|| AxumError::NotFound(format!("beacon state at slot {}", slot)))?;
 
         Ok((root, execution_optimistic, finalized))
     }
@@ -136,7 +131,7 @@ impl StateId {
     pub fn fork_and_execution_optimistic<T: BeaconChainTypes>(
         &self,
         chain: &BeaconChain<T>,
-    ) -> Result<(Fork, bool), warp::Rejection> {
+    ) -> Result<(Fork, bool), AxumError> {
         self.map_state_and_execution_optimistic_and_finalized(
             chain,
             |state, execution_optimistic, _finalized| Ok((state.fork(), execution_optimistic)),
@@ -149,7 +144,7 @@ impl StateId {
     pub fn fork_and_execution_optimistic_and_finalized<T: BeaconChainTypes>(
         &self,
         chain: &BeaconChain<T>,
-    ) -> Result<(Fork, bool, bool), warp::Rejection> {
+    ) -> Result<(Fork, bool, bool), AxumError> {
         self.map_state_and_execution_optimistic_and_finalized(
             chain,
             |state, execution_optimistic, finalized| {
@@ -159,10 +154,7 @@ impl StateId {
     }
 
     /// Convenience function to compute `fork` when `execution_optimistic` isn't desired.
-    pub fn fork<T: BeaconChainTypes>(
-        &self,
-        chain: &BeaconChain<T>,
-    ) -> Result<Fork, warp::Rejection> {
+    pub fn fork<T: BeaconChainTypes>(&self, chain: &BeaconChain<T>) -> Result<Fork, AxumError> {
         self.fork_and_execution_optimistic(chain)
             .map(|(fork, _)| fork)
     }
@@ -171,13 +163,13 @@ impl StateId {
     pub fn state<T: BeaconChainTypes>(
         &self,
         chain: &BeaconChain<T>,
-    ) -> Result<(BeaconState<T::EthSpec>, ExecutionOptimistic, Finalized), warp::Rejection> {
+    ) -> Result<(BeaconState<T::EthSpec>, ExecutionOptimistic, Finalized), AxumError> {
         let ((state_root, execution_optimistic, finalized), slot_opt) = match &self.0 {
             CoreStateId::Head => {
                 let (cached_head, execution_status) = chain
                     .canonical_head
                     .head_and_execution_status()
-                    .map_err(warp_utils::reject::beacon_chain_error)?;
+                    .map_err(|e| AxumError::BeaconChainError(e.to_string()))?;
                 return Ok((
                     cached_head.snapshot.beacon_state.clone(),
                     execution_status.is_optimistic_or_invalid(),
@@ -190,15 +182,8 @@ impl StateId {
 
         let state = chain
             .get_state(&state_root, slot_opt)
-            .map_err(warp_utils::reject::beacon_chain_error)
-            .and_then(|opt| {
-                opt.ok_or_else(|| {
-                    warp_utils::reject::custom_not_found(format!(
-                        "beacon state at root {}",
-                        state_root
-                    ))
-                })
-            })?;
+            .map_err(|e| AxumError::BeaconChainError(e.to_string()))?
+            .ok_or_else(|| AxumError::NotFound(format!("beacon state at root {}", state_root)))?;
 
         Ok((state, execution_optimistic, finalized))
     }
@@ -214,16 +199,16 @@ impl StateId {
         &self,
         chain: &BeaconChain<T>,
         func: F,
-    ) -> Result<U, warp::Rejection>
+    ) -> Result<U, AxumError>
     where
-        F: Fn(&BeaconState<T::EthSpec>, bool, bool) -> Result<U, warp::Rejection>,
+        F: Fn(&BeaconState<T::EthSpec>, bool, bool) -> Result<U, AxumError>,
     {
         let (state, execution_optimistic, finalized) = match &self.0 {
             CoreStateId::Head => {
                 let (head, execution_status) = chain
                     .canonical_head
                     .head_and_execution_status()
-                    .map_err(warp_utils::reject::beacon_chain_error)?;
+                    .map_err(|e| AxumError::BeaconChainError(e.to_string()))?;
                 return func(
                     &head.snapshot.beacon_state,
                     execution_status.is_optimistic_or_invalid(),
@@ -256,7 +241,7 @@ impl fmt::Display for StateId {
 pub fn checkpoint_slot_and_execution_optimistic<T: BeaconChainTypes>(
     chain: &BeaconChain<T>,
     checkpoint: Checkpoint,
-) -> Result<(Slot, ExecutionOptimistic), warp::reject::Rejection> {
+) -> Result<(Slot, ExecutionOptimistic), AxumError> {
     let slot = checkpoint.epoch.start_slot(T::EthSpec::slots_per_epoch());
     let fork_choice = chain.canonical_head.fork_choice_read_lock();
     let finalized_checkpoint = fork_choice.cached_fork_choice_view().finalized_checkpoint;
@@ -271,8 +256,7 @@ pub fn checkpoint_slot_and_execution_optimistic<T: BeaconChainTypes>(
 
     let execution_optimistic = fork_choice
         .is_optimistic_or_invalid_block_no_fallback(root)
-        .map_err(BeaconChainError::ForkChoiceError)
-        .map_err(warp_utils::reject::beacon_chain_error)?;
+        .map_err(|e| AxumError::BeaconChainError(e.to_string()))?;
 
     Ok((slot, execution_optimistic))
 }

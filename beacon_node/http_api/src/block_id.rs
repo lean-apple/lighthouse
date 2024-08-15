@@ -6,6 +6,7 @@ use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
 use types::{BlobSidecarList, EthSpec, Hash256, SignedBeaconBlock, SignedBlindedBeaconBlock, Slot};
+use crate::axum_server::error::Error as AxumError;
 
 /// Wraps `eth2::types::BlockId` and provides a simple way to obtain a block or root for a given
 /// `BlockId`.
@@ -27,13 +28,13 @@ impl BlockId {
     pub fn root<T: BeaconChainTypes>(
         &self,
         chain: &BeaconChain<T>,
-    ) -> Result<(Hash256, ExecutionOptimistic, Finalized), warp::Rejection> {
+    ) -> Result<(Hash256, ExecutionOptimistic, Finalized), AxumError> {
         match &self.0 {
             CoreBlockId::Head => {
                 let (cached_head, execution_status) = chain
                     .canonical_head
                     .head_and_execution_status()
-                    .map_err(warp_utils::reject::beacon_chain_error)?;
+                    .map_err(|e| AxumError::BeaconChainError(e.to_string()))?;
                 Ok((
                     cached_head.head_block_root(),
                     execution_status.is_optimistic_or_invalid(),
@@ -133,7 +134,7 @@ impl BlockId {
             ExecutionOptimistic,
             Finalized,
         ),
-        warp::Rejection,
+        AxumError,
     > {
         match &self.0 {
             CoreBlockId::Head => {
@@ -196,14 +197,14 @@ impl BlockId {
             ExecutionOptimistic,
             Finalized,
         ),
-        warp::Rejection,
+        AxumError,
     > {
         match &self.0 {
             CoreBlockId::Head => {
                 let (cached_head, execution_status) = chain
                     .canonical_head
                     .head_and_execution_status()
-                    .map_err(warp_utils::reject::beacon_chain_error)?;
+                    .map_err(|e| AxumError::BeaconChainError(format!("{:?}", e)))?;
                 Ok((
                     cached_head.snapshot.beacon_block.clone(),
                     execution_status.is_optimistic_or_invalid(),
@@ -212,42 +213,25 @@ impl BlockId {
             }
             CoreBlockId::Slot(slot) => {
                 let (root, execution_optimistic, finalized) = self.root(chain)?;
-                chain
+                let block = chain
                     .get_block(&root)
                     .await
-                    .map_err(warp_utils::reject::beacon_chain_error)
-                    .and_then(|block_opt| match block_opt {
-                        Some(block) => {
-                            if block.slot() != *slot {
-                                return Err(warp_utils::reject::custom_not_found(format!(
-                                    "slot {} was skipped",
-                                    slot
-                                )));
-                            }
-                            Ok((Arc::new(block), execution_optimistic, finalized))
-                        }
-                        None => Err(warp_utils::reject::custom_not_found(format!(
-                            "beacon block with root {}",
-                            root
-                        ))),
-                    })
+                    .map_err(|e| AxumError::BeaconChainError(format!("{:?}", e)))?
+                    .ok_or_else(|| AxumError::NotFound(format!("beacon block with root {}", root)))?;
+    
+                if block.slot() != *slot {
+                    return Err(AxumError::NotFound(format!("slot {} was skipped", slot)));
+                }
+                Ok((Arc::new(block), execution_optimistic, finalized))
             }
             _ => {
                 let (root, execution_optimistic, finalized) = self.root(chain)?;
-                chain
+                let block = chain
                     .get_block(&root)
                     .await
-                    .map_err(warp_utils::reject::beacon_chain_error)
-                    .and_then(|block_opt| {
-                        block_opt
-                            .map(|block| (Arc::new(block), execution_optimistic, finalized))
-                            .ok_or_else(|| {
-                                warp_utils::reject::custom_not_found(format!(
-                                    "beacon block with root {}",
-                                    root
-                                ))
-                            })
-                    })
+                    .map_err(|e| AxumError::BeaconChainError(format!("{:?}", e)))?
+                    .ok_or_else(|| AxumError::NotFound(format!("beacon block with root {}", root)))?;
+                Ok((Arc::new(block), execution_optimistic, finalized))
             }
         }
     }
@@ -256,18 +240,18 @@ impl BlockId {
     pub fn blob_sidecar_list<T: BeaconChainTypes>(
         &self,
         chain: &BeaconChain<T>,
-    ) -> Result<BlobSidecarList<T::EthSpec>, warp::Rejection> {
+    ) -> Result<BlobSidecarList<T::EthSpec>, AxumError> {
         let root = self.root(chain)?.0;
         chain
             .get_blobs(&root)
-            .map_err(warp_utils::reject::beacon_chain_error)
+            .map_err(|e| AxumError::BeaconChainError(e.to_string()))
     }
 
     pub fn blob_sidecar_list_filtered<T: BeaconChainTypes>(
         &self,
         indices: BlobIndicesQuery,
         chain: &BeaconChain<T>,
-    ) -> Result<BlobSidecarList<T::EthSpec>, warp::Rejection> {
+    ) -> Result<BlobSidecarList<T::EthSpec>, AxumError> {
         let blob_sidecar_list = self.blob_sidecar_list(chain)?;
         let blob_sidecar_list_filtered = match indices.indices {
             Some(vec) => {
@@ -276,7 +260,7 @@ impl BlockId {
                     .filter(|blob_sidecar| vec.contains(&blob_sidecar.index))
                     .collect();
                 BlobSidecarList::new(list)
-                    .map_err(|e| warp_utils::reject::custom_server_error(format!("{:?}", e)))?
+                    .map_err(|e| AxumError::ServerError(format!("{:?}", e)))?
             }
             None => blob_sidecar_list,
         };

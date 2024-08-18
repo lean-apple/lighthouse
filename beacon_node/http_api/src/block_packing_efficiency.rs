@@ -13,7 +13,7 @@ use types::{
     AttestationRef, BeaconCommittee, BeaconState, BeaconStateError, BlindedPayload, ChainSpec,
     Epoch, EthSpec, Hash256, OwnedBeaconCommittee, RelativeEpoch, SignedBeaconBlock, Slot,
 };
-use warp_utils::reject::{beacon_chain_error, custom_bad_request, custom_server_error};
+use crate::axum_server::error::Error as AxumError;
 
 /// Load blocks from block roots in chunks to reduce load on memory.
 const BLOCK_ROOT_CHUNK_SIZE: usize = 100;
@@ -239,7 +239,7 @@ impl<E: EthSpec> PackingEfficiencyHandler<E> {
 pub fn get_block_packing_efficiency<T: BeaconChainTypes>(
     query: BlockPackingEfficiencyQuery,
     chain: Arc<BeaconChain<T>>,
-) -> Result<Vec<BlockPackingEfficiency>, warp::Rejection> {
+) -> Result<Vec<BlockPackingEfficiency>, AxumError> {
     let spec = &chain.spec;
 
     let start_epoch = query.start_epoch;
@@ -251,7 +251,7 @@ pub fn get_block_packing_efficiency<T: BeaconChainTypes>(
 
     // Check query is valid.
     if start_epoch > end_epoch || start_epoch == 0 {
-        return Err(custom_bad_request(format!(
+        return Err(AxumError::BadRequest(format!(
             "invalid start and end epochs: {}, {}",
             start_epoch, end_epoch
         )));
@@ -263,9 +263,9 @@ pub fn get_block_packing_efficiency<T: BeaconChainTypes>(
     // Load block roots.
     let mut block_roots: Vec<Hash256> = chain
         .forwards_iter_block_roots_until(start_slot_of_prior_epoch, end_slot)
-        .map_err(beacon_chain_error)?
+        .map_err(|e| AxumError::BeaconChainError(e.to_string()))?
         .collect::<Result<Vec<(Hash256, Slot)>, _>>()
-        .map_err(beacon_chain_error)?
+        .map_err(|e| AxumError::BeaconChainError(e.to_string()))?
         .iter()
         .map(|(root, _)| *root)
         .collect();
@@ -273,14 +273,14 @@ pub fn get_block_packing_efficiency<T: BeaconChainTypes>(
 
     let first_block_root = block_roots
         .first()
-        .ok_or_else(|| custom_server_error("no blocks were loaded".to_string()))?;
+        .ok_or_else(|| AxumError::ServerError("no blocks were loaded".to_string()))?;
 
     let first_block = chain
         .get_blinded_block(first_block_root)
         .and_then(|maybe_block| {
             maybe_block.ok_or(BeaconChainError::MissingBeaconBlock(*first_block_root))
         })
-        .map_err(beacon_chain_error)?;
+        .map_err(|e| AxumError::BeaconChainError(e.to_string()))?;
 
     // Load state for block replay.
     let starting_state_root = first_block.state_root();
@@ -290,7 +290,7 @@ pub fn get_block_packing_efficiency<T: BeaconChainTypes>(
         .and_then(|maybe_state| {
             maybe_state.ok_or(BeaconChainError::MissingBeaconState(starting_state_root))
         })
-        .map_err(beacon_chain_error)?;
+        .map_err(|e| AxumError::BeaconChainError(e.to_string()))?;
 
     // Initialize response vector.
     let mut response = Vec::new();
@@ -298,7 +298,7 @@ pub fn get_block_packing_efficiency<T: BeaconChainTypes>(
     // Initialize handler.
     let handler = Arc::new(Mutex::new(
         PackingEfficiencyHandler::new(prior_epoch, starting_state.clone(), spec)
-            .map_err(|e| custom_server_error(format!("{:?}", e)))?,
+            .map_err(|e| AxumError::ServerError(format!("{:?}", e)))?,
     ));
 
     let pre_slot_hook =
@@ -392,13 +392,13 @@ pub fn get_block_packing_efficiency<T: BeaconChainTypes>(
                     .and_then(|maybe_block| {
                         maybe_block.ok_or(BeaconChainError::MissingBeaconBlock(*root))
                     })
-                    .map_err(beacon_chain_error)
+                    .map_err(|e| AxumError::BeaconChainError(e.to_string()))
             })
             .collect::<Result<Vec<_>, _>>()?;
 
         replayer = replayer
             .apply_blocks(blocks, None)
-            .map_err(|e: PackingEfficiencyError| custom_server_error(format!("{:?}", e)))?;
+            .map_err(|e: PackingEfficiencyError| AxumError::ServerError(format!("{:?}", e)))?;
     }
 
     drop(replayer);

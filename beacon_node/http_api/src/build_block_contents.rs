@@ -1,12 +1,12 @@
-use beacon_chain::{BeaconBlockResponse, BeaconBlockResponseWrapper, BlockProductionError};
+use beacon_chain::{BeaconBlockResponse, BeaconBlockResponseWrapper};
 use eth2::types::{BlockContents, FullBlockContents, ProduceBlockV3Response};
 use types::{EthSpec, ForkName};
-type Error = warp::reject::Rejection;
+use crate::axum_server::error::Error as AxumError;
 
 pub fn build_block_contents<E: EthSpec>(
     fork_name: ForkName,
     block_response: BeaconBlockResponseWrapper<E>,
-) -> Result<ProduceBlockV3Response<E>, Error> {
+) -> Result<ProduceBlockV3Response<E>, AxumError> {
     match block_response {
         BeaconBlockResponseWrapper::Blinded(block) => {
             Ok(ProduceBlockV3Response::Blinded(block.block))
@@ -25,9 +25,7 @@ pub fn build_block_contents<E: EthSpec>(
                 } = block;
 
                 let Some((kzg_proofs, blobs)) = blob_items else {
-                    return Err(warp_utils::reject::block_production_error(
-                        BlockProductionError::MissingBlobs,
-                    ));
+                    return Err(AxumError::BlockProductionError("Missing blobs".to_string()));
                 };
 
                 Ok(ProduceBlockV3Response::Full(

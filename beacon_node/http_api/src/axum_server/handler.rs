@@ -1,9 +1,14 @@
 use super::task_spawner::{Priority, TaskSpawner};
-use axum::extract::{Query, RawQuery};
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
-use axum::response::sse::{Event, Sse};
-use axum::response::{IntoResponse, Response};
-use axum::{extract::Path, extract::Request, extract::State, Json};
+use axum::{
+    body::Body,
+    extract::{Path, Query, RawQuery, Request, State},
+    http::{HeaderMap, HeaderValue, StatusCode},
+    response::{
+        sse::{Event, Sse},
+        IntoResponse, Response,
+    },
+    Json,
+};
 use beacon_chain::attestation_verification::{Error as AttnError, VerifiedAttestation};
 use beacon_chain::validator_monitor::timestamp_now;
 use eth2::{
@@ -768,7 +773,7 @@ async fn produce_block<T: BeaconChainTypes>(
 
     let fork_name = block_response
         .fork_name(&chain.spec)
-        .map_err(|e| HandlerError::InconsistentFork(format!("{:?}", e)))?; // TODO: reuse inconsistent_fork_rejection
+        .map_err(inconsistent_fork_rejection)?;
 
     Ok((block_response, fork_name))
 }
@@ -790,16 +795,27 @@ pub async fn get_validator_blocks_v2<T: BeaconChainTypes>(
         produce_block(chain, slot, query, BlockProductionVersion::FullV2).await?;
 
     let block_contents = build_block_contents::build_block_contents(fork_name, block_response)
-        .map_err(|e| HandlerError::Other(format!("failed to build block contents: {:?}", e)));
+        .map_err(|e| HandlerError::Other(format!("failed to build block contents: {:?}", e)))?;
 
     match accept_header {
         Some(api_types::Accept::Ssz) => {
-            let body = block_contents.as_ssz_bytes();
+            let ssz_bytes = block_contents.as_ssz_bytes();
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                CONTENT_TYPE_HEADER,
+                HeaderValue::from_static(SSZ_CONTENT_TYPE_HEADER),
+            );
+            headers.insert(
+                CONSENSUS_VERSION_HEADER,
+                HeaderValue::from_str(&fork_name.to_string())
+                    .map_err(|_| HandlerError::ServerError("invalid consensus version header value".to_string()))?,
+            );
+
             Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header(CONTENT_TYPE_HEADER, SSZ_CONTENT_TYPE_HEADER)
                 .header(CONSENSUS_VERSION_HEADER, fork_name.to_string())
-                .body(body)
+                .body(Body::from(ssz_bytes))
                 .map_err(|e| {
                     HandlerError::ServerError(format!("failed to create SSZ response: {}", e))
                 })?)
@@ -874,7 +890,7 @@ pub async fn get_validator_blocks_v3<T: BeaconChainTypes>(
                     CONSENSUS_BLOCK_VALUE_HEADER,
                     consensus_block_value.to_string(),
                 )
-                .body(body)
+                .body(Body::from(body))
                 .map_err(|e| {
                     HandlerError::ServerError(format!("failed to create SSZ response: {}", e))
                 })?)

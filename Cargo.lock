@@ -3886,7 +3886,6 @@ dependencies = [
  "tracing-subscriber",
  "tree_hash",
  "types",
- "warp",
  "warp_utils",
 ]
 

@@ -5,7 +5,7 @@ use eth2::types::{Epoch, ValidatorStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use warp_utils::reject::beacon_chain_error;
+use crate::axum_server::error::Error as AxumError;
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ValidatorCountResponse {
@@ -22,7 +22,7 @@ pub struct ValidatorCountResponse {
 
 pub fn get_validator_count<T: BeaconChainTypes>(
     chain: Arc<BeaconChain<T>>,
-) -> Result<ValidatorCountResponse, warp::Rejection> {
+) -> Result<ValidatorCountResponse, AxumError> {
     let spec = &chain.spec;
     let mut active_ongoing = 0;
     let mut active_exiting = 0;
@@ -58,7 +58,7 @@ pub fn get_validator_count<T: BeaconChainTypes>(
             }
             Ok::<(), BeaconChainError>(())
         })
-        .map_err(beacon_chain_error)?;
+        .map_err(|e| AxumError::BeaconChainError(format!("{:?}", e)))?;
 
     Ok(ValidatorCountResponse {
         active_ongoing,
@@ -100,8 +100,9 @@ pub struct ValidatorInfoResponse {
 pub fn get_validator_info<T: BeaconChainTypes>(
     request_data: ValidatorInfoRequestData,
     chain: Arc<BeaconChain<T>>,
-) -> Result<ValidatorInfoResponse, warp::Rejection> {
-    let current_epoch = chain.epoch().map_err(beacon_chain_error)?;
+) -> Result<ValidatorInfoResponse, AxumError> {
+    let current_epoch = chain.epoch().map_err(|e| AxumError::BeaconChainError(format!("{:?}", e)))?;
+
 
     let epochs = current_epoch.saturating_sub(HISTORIC_EPOCHS).as_u64()..=current_epoch.as_u64();
 
@@ -176,7 +177,7 @@ pub struct ValidatorMetricsResponse {
 pub fn post_validator_monitor_metrics<T: BeaconChainTypes>(
     request_data: ValidatorMetricsRequestData,
     chain: Arc<BeaconChain<T>>,
-) -> Result<ValidatorMetricsResponse, warp::Rejection> {
+) -> Result<ValidatorMetricsResponse,AxumError> {
     let validator_ids = chain
         .validator_monitor
         .read()

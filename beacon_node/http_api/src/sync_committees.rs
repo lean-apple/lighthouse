@@ -1,6 +1,7 @@
 //! Handlers for sync committee endpoints.
 
 use crate::publish_pubsub_message;
+use axum::Json;
 use beacon_chain::sync_committee_verification::{
     Error as SyncVerificationError, VerifiedSyncCommitteeMessage,
 };
@@ -20,6 +21,7 @@ use types::{
     slot_data::SlotData, BeaconStateError, Epoch, EthSpec, SignedContributionAndProof,
     SyncCommitteeMessage, SyncDuty, SyncSubnetId,
 };
+use crate::axum_server::error::Error as AxumError;
 
 /// The struct that is returned to the requesting HTTP client.
 type SyncDuties = api_types::ExecutionOptimisticResponse<Vec<SyncDuty>>;
@@ -29,7 +31,7 @@ pub fn sync_committee_duties<T: BeaconChainTypes>(
     request_epoch: Epoch,
     request_indices: &[u64],
     chain: &BeaconChain<T>,
-) -> Result<SyncDuties, warp::reject::Rejection> {
+) -> Result<Json<SyncDuties>, AxumError> {
     let Some(altair_fork_epoch) = chain.spec.altair_fork_epoch else {
         // Empty response for networks with Altair disabled.
         return Ok(convert_to_response(vec![], false));
@@ -39,7 +41,7 @@ pub fn sync_committee_duties<T: BeaconChainTypes>(
     // still dependent on the head. So using `is_optimistic_head` is fine for both cases.
     let execution_optimistic = chain
         .is_optimistic_or_invalid_head()
-        .map_err(warp_utils::reject::beacon_chain_error)?;
+        .map_err(|e| AxumError::BeaconChainError(format!("{:?}", e)))?;
 
     // Try using the head's sync committees to satisfy the request. This should be sufficient for
     // the vast majority of requests. Rather than checking if we think the request will succeed in a
@@ -55,24 +57,24 @@ pub fn sync_committee_duties<T: BeaconChainTypes>(
             ..
         }))
         | Err(BeaconChainError::SyncDutiesError(BeaconStateError::IncorrectStateVariant)) => (),
-        Err(e) => return Err(warp_utils::reject::beacon_chain_error(e)),
+        Err(e) => return Err(AxumError::BeaconChainError(format!("{:?}", e))),
     }
 
     let duties = duties_from_state_load(request_epoch, request_indices, altair_fork_epoch, chain)
-        .map_err(|e| match e {
-        BeaconChainError::SyncDutiesError(BeaconStateError::SyncCommitteeNotKnown {
-            current_epoch,
-            ..
-        }) => warp_utils::reject::custom_bad_request(format!(
-            "invalid epoch: {}, current epoch: {}",
-            request_epoch, current_epoch
-        )),
-        e => warp_utils::reject::beacon_chain_error(e),
-    })?;
-    Ok(convert_to_response(
-        verify_unknown_validators(duties, request_epoch, chain)?,
-        execution_optimistic,
-    ))
+    .map_err(|e| match e {
+    BeaconChainError::SyncDutiesError(BeaconStateError::SyncCommitteeNotKnown {
+        current_epoch,
+        ..
+    }) => AxumError::BadRequest(format!(
+        "invalid epoch: {}, current epoch: {}",
+        request_epoch, current_epoch
+    )),
+    e => AxumError::BeaconChainError(format!("{:?}", e)),
+})?;
+Ok(Json(convert_to_response(
+    verify_unknown_validators(duties, request_epoch, chain)?,
+    execution_optimistic,
+)))
 }
 
 /// Slow path for duties: load a state and use it to compute the duties.
@@ -133,7 +135,7 @@ fn verify_unknown_validators<T: BeaconChainTypes>(
     duties: Vec<Result<Option<SyncDuty>, BeaconStateError>>,
     request_epoch: Epoch,
     chain: &BeaconChain<T>,
-) -> Result<Vec<Option<SyncDuty>>, warp::reject::Rejection> {
+) -> Result<Vec<Option<SyncDuty>>, AxumError> {
     // Lazily load the request_epoch_state, as it is only needed if there are any UnknownValidator
     let mut request_epoch_state = None;
 
@@ -162,9 +164,9 @@ fn verify_unknown_validators<T: BeaconChainTypes>(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|err| match err {
             BeaconChainError::SyncDutiesError(BeaconStateError::UnknownValidator(idx)) => {
-                warp_utils::reject::custom_bad_request(format!("invalid validator index: {idx}"))
+                AxumError::BadRequest(format!("invalid validator index: {idx}"))
             }
-            e => warp_utils::reject::beacon_chain_error(e),
+            e => AxumError::BeaconChainError(format!("{:?}", e)),
         })
 }
 
@@ -179,7 +181,7 @@ pub fn process_sync_committee_signatures<T: BeaconChainTypes>(
     network_tx: UnboundedSender<NetworkMessage<T::EthSpec>>,
     chain: &BeaconChain<T>,
     log: Logger,
-) -> Result<(), warp::reject::Rejection> {
+) -> Result<(), AxumError> {
     let mut failures = vec![];
 
     let seen_timestamp = timestamp_now();
@@ -286,10 +288,10 @@ pub fn process_sync_committee_signatures<T: BeaconChainTypes>(
     if failures.is_empty() {
         Ok(())
     } else {
-        Err(warp_utils::reject::indexed_bad_request(
-            "error processing sync committee signatures".to_string(),
-            failures,
-        ))
+        Err(AxumError::BadRequest(format!(
+            "error processing sync committee signatures: {:?}",
+            failures
+        )))
     }
 }
 
@@ -313,7 +315,7 @@ pub fn process_signed_contribution_and_proofs<T: BeaconChainTypes>(
     network_tx: UnboundedSender<NetworkMessage<T::EthSpec>>,
     chain: &BeaconChain<T>,
     log: Logger,
-) -> Result<(), warp::reject::Rejection> {
+) -> Result<(), AxumError> {
     let mut verified_contributions = Vec::with_capacity(signed_contribution_and_proofs.len());
     let mut failures = vec![];
 
@@ -392,10 +394,10 @@ pub fn process_signed_contribution_and_proofs<T: BeaconChainTypes>(
     }
 
     if !failures.is_empty() {
-        Err(warp_utils::reject::indexed_bad_request(
-            "error processing contribution and proofs".to_string(),
-            failures,
-        ))
+        Err(AxumError::BadRequest(format!(
+            "error processing contribution and proofs: {:?}",
+            failures
+        )))
     } else {
         Ok(())
     }

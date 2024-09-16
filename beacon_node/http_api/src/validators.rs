@@ -1,4 +1,5 @@
 use crate::state_id::StateId;
+use crate::axum_server::error::Error as AxumError;
 use beacon_chain::{BeaconChain, BeaconChainTypes};
 use eth2::types::{
     self as api_types, ExecutionOptimisticFinalizedResponse, ValidatorBalanceData, ValidatorData,
@@ -6,12 +7,12 @@ use eth2::types::{
 };
 use std::{collections::HashSet, sync::Arc};
 
-pub fn get_beacon_state_validators<T: BeaconChainTypes>(
+pub async fn get_beacon_state_validators<T: BeaconChainTypes>(
     state_id: StateId,
     chain: Arc<BeaconChain<T>>,
     query_ids: &Option<Vec<ValidatorId>>,
     query_statuses: &Option<Vec<ValidatorStatus>>,
-) -> Result<ExecutionOptimisticFinalizedResponse<Vec<ValidatorData>>, warp::Rejection> {
+) -> Result<ExecutionOptimisticFinalizedResponse<Vec<ValidatorData>>, AxumError> {
     let (data, execution_optimistic, finalized) = state_id
         .map_state_and_execution_optimistic_and_finalized(
             &chain,
@@ -63,7 +64,8 @@ pub fn get_beacon_state_validators<T: BeaconChainTypes>(
                     finalized,
                 ))
             },
-        )?;
+        )
+        .map_err(|e| AxumError::BeaconChainError(format!("{:?}", e)))?;
 
     Ok(ExecutionOptimisticFinalizedResponse {
         data,
@@ -72,11 +74,11 @@ pub fn get_beacon_state_validators<T: BeaconChainTypes>(
     })
 }
 
-pub fn get_beacon_state_validator_balances<T: BeaconChainTypes>(
+pub async fn get_beacon_state_validator_balances<T: BeaconChainTypes>(
     state_id: StateId,
     chain: Arc<BeaconChain<T>>,
     optional_ids: Option<&[ValidatorId]>,
-) -> Result<ExecutionOptimisticFinalizedResponse<Vec<ValidatorBalanceData>>, warp::Rejection> {
+) -> Result<ExecutionOptimisticFinalizedResponse<Vec<ValidatorBalanceData>>, AxumError> {
     let (data, execution_optimistic, finalized) = state_id
         .map_state_and_execution_optimistic_and_finalized(
             &chain,
@@ -106,7 +108,8 @@ pub fn get_beacon_state_validator_balances<T: BeaconChainTypes>(
                     finalized,
                 ))
             },
-        )?;
+        )
+        .map_err(|e| AxumError::BeaconChainError(format!("{:?}", e)))?;
 
     Ok(api_types::ExecutionOptimisticFinalizedResponse {
         data,

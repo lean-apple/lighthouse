@@ -1,4 +1,5 @@
 use crate::state_id::StateId;
+use crate::axum_server::error::Error as AxumError;
 use beacon_chain::{BeaconChain, BeaconChainTypes};
 use eth2::{
     lighthouse::{GlobalValidatorInclusionData, ValidatorInclusionData},
@@ -11,11 +12,13 @@ use types::{BeaconState, BeaconStateError, ChainSpec, Epoch, EthSpec};
 fn end_of_epoch_state<T: BeaconChainTypes>(
     epoch: Epoch,
     chain: &BeaconChain<T>,
-) -> Result<BeaconState<T::EthSpec>, warp::reject::Rejection> {
+) -> Result<BeaconState<T::EthSpec>, AxumError> {
     let target_slot = epoch.end_slot(T::EthSpec::slots_per_epoch());
     // The execution status is not returned, any functions which rely upon this method might return
     // optimistic information without explicitly declaring so.
-    let (state, _execution_status, _finalized) = StateId::from_slot(target_slot).state(chain)?;
+    let (state, _execution_status, _finalized) = StateId::from_slot(target_slot)
+        .state(chain)
+        .map_err(|e| AxumError::BeaconChainError(format!("{:?}", e)))?;
     Ok(state)
 }
 
@@ -27,13 +30,14 @@ fn end_of_epoch_state<T: BeaconChainTypes>(
 fn get_epoch_processing_summary<E: EthSpec>(
     state: &mut BeaconState<E>,
     spec: &ChainSpec,
-) -> Result<EpochProcessingSummary<E>, warp::reject::Rejection> {
+) -> Result<EpochProcessingSummary<E>, AxumError> {
     process_epoch(state, spec)
-        .map_err(|e| warp_utils::reject::custom_server_error(format!("{:?}", e)))
+        .map_err(|e| AxumError::ServerError(format!("Error processing epoch: {:?}", e)))
 }
 
-fn convert_cache_error(error: BeaconStateError) -> warp::reject::Rejection {
-    warp_utils::reject::custom_server_error(format!("{:?}", error))
+/// Convert a `BeaconStateError` into an `Error`.
+fn convert_cache_error(error: BeaconStateError) -> AxumError {
+    AxumError::ServerError(format!("Cache error: {:?}", error))
 }
 
 /// Returns information about *all validators* (i.e., global) and how they performed during a given
@@ -41,7 +45,7 @@ fn convert_cache_error(error: BeaconStateError) -> warp::reject::Rejection {
 pub fn global_validator_inclusion_data<T: BeaconChainTypes>(
     epoch: Epoch,
     chain: &BeaconChain<T>,
-) -> Result<GlobalValidatorInclusionData, warp::Rejection> {
+) -> Result<GlobalValidatorInclusionData, AxumError> {
     let mut state = end_of_epoch_state(epoch, chain)?;
     let summary = get_epoch_processing_summary(&mut state, &chain.spec)?;
 
@@ -64,19 +68,18 @@ pub fn validator_inclusion_data<T: BeaconChainTypes>(
     epoch: Epoch,
     validator_id: &ValidatorId,
     chain: &BeaconChain<T>,
-) -> Result<Option<ValidatorInclusionData>, warp::Rejection> {
+) -> Result<Option<ValidatorInclusionData>, AxumError> {
     let mut state = end_of_epoch_state(epoch, chain)?;
 
-    state
-        .update_pubkey_cache()
-        .map_err(warp_utils::reject::beacon_state_error)?;
+    state.update_pubkey_cache()
+        .map_err(|e| AxumError::BeaconStateError(format!("{:?}", e)))?;
 
     let validator_index = match validator_id {
         ValidatorId::Index(index) => *index as usize,
         ValidatorId::PublicKey(pubkey) => {
             if let Some(index) = state
                 .get_validator_index(pubkey)
-                .map_err(warp_utils::reject::beacon_state_error)?
+                .map_err(|e| AxumError::BeaconStateError(format!("{:?}", e)))?
             {
                 index
             } else {

@@ -348,6 +348,7 @@ pub async fn get_beacon_state_validator_balances<T: BeaconChainTypes>(
         chain,
         validator_queries.as_deref(),
     )
+    .await
     .map_err(|e| HandlerError::ServerError(format!("failed to get validator balances: {:?}", e)))?;
 
     Ok(Json(response))

@@ -1,4 +1,3 @@
-use crate::axum_server::error::Error as AxumError;
 use beacon_chain::{BeaconChain, BeaconChainError, BeaconChainTypes};
 use eth2::lighthouse::{
     AttestationPerformance, AttestationPerformanceQuery, AttestationPerformanceStatistics,
@@ -8,6 +7,7 @@ use state_processing::{
 };
 use std::sync::Arc;
 use types::{BeaconState, BeaconStateError, EthSpec, Hash256};
+use crate::axum_server::error::Error as AxumError;
 const MAX_REQUEST_RANGE_EPOCHS: usize = 100;
 const BLOCK_ROOT_CHUNK_SIZE: usize = 100;
 

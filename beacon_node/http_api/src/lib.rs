@@ -98,6 +98,7 @@ use warp::sse::Event;
 use warp::Reply;
 use warp::{http::Response, Filter, Rejection};
 use warp_utils::{query::multi_key_query, uor::UnifyingOrFilter};
+use crate::axum_server::error::Error as AxumError;
 
 const API_PREFIX: &str = "eth";
 
@@ -4636,7 +4637,7 @@ pub fn serve<T: BeaconChainTypes>(
 fn publish_pubsub_message<E: EthSpec>(
     network_tx: &UnboundedSender<NetworkMessage<E>>,
     message: PubsubMessage<E>,
-) -> Result<(), warp::Rejection> {
+) -> Result<(), AxumError> {
     publish_network_message(
         network_tx,
         NetworkMessage::Publish {
@@ -4649,19 +4650,16 @@ fn publish_pubsub_message<E: EthSpec>(
 fn publish_pubsub_messages<E: EthSpec>(
     network_tx: &UnboundedSender<NetworkMessage<E>>,
     messages: Vec<PubsubMessage<E>>,
-) -> Result<(), warp::Rejection> {
+) -> Result<(), AxumError> {
     publish_network_message(network_tx, NetworkMessage::Publish { messages })
 }
 
 /// Publish a message to the libp2p network.
-fn publish_network_message<E: EthSpec>(
-    network_tx: &UnboundedSender<NetworkMessage<E>>,
-    message: NetworkMessage<E>,
-) -> Result<(), warp::Rejection> {
-    network_tx.send(message).map_err(|e| {
-        warp_utils::reject::custom_server_error(format!(
-            "unable to publish to network channel: {}",
-            e
-        ))
-    })
+fn publish_pubsub_message<T: EthSpec>(
+    network_tx: &UnboundedSender<NetworkMessage<T>>,
+    message: PubsubMessage<T>,
+) -> Result<(), AxumError> {
+    network_tx
+        .send(NetworkMessage::Publish { message })
+        .map_err(|e| AxumError::ServerError(format!("Failed to publish message: {:?}", e)))
 }

@@ -1,9 +1,10 @@
+use axum::{Json, response::{IntoResponse, Response}};
 use beacon_processor::{BeaconProcessorSend, BlockingOrAsync, Work, WorkEvent};
 use serde::Serialize;
 use std::future::Future;
 use tokio::sync::{mpsc::error::TrySendError, oneshot};
 use types::EthSpec;
-use warp::reply::{Reply, Response};
+use crate::axum_server::error::Error as AxumError;
 
 /// Maps a request to a queue in the `BeaconProcessor`.
 #[derive(Clone, Copy)]
@@ -35,23 +36,6 @@ pub struct TaskSpawner<E: EthSpec> {
     beacon_processor_send: Option<BeaconProcessorSend<E>>,
 }
 
-/// Convert a warp `Rejection` into a `Response`.
-///
-/// This function should *always* be used to convert rejections into responses. This prevents warp
-/// from trying to backtrack in strange ways. See: https://github.com/sigp/lighthouse/issues/3404
-pub async fn convert_rejection<T: Reply>(res: Result<T, warp::Rejection>) -> Response {
-    match res {
-        Ok(response) => response.into_response(),
-        Err(e) => match warp_utils::reject::handle_rejection(e).await {
-            Ok(reply) => reply.into_response(),
-            Err(_) => warp::reply::with_status(
-                warp::reply::json(&"unhandled error"),
-                eth2::StatusCode::INTERNAL_SERVER_ERROR,
-            )
-            .into_response(),
-        },
-    }
-}
 
 impl<E: EthSpec> TaskSpawner<E> {
     pub fn new(beacon_processor_send: Option<BeaconProcessorSend<E>>) -> Self {
@@ -65,9 +49,9 @@ impl<E: EthSpec> TaskSpawner<E> {
         self,
         priority: Priority,
         func: F,
-    ) -> Result<T, warp::Rejection>
+    ) -> Result<T, AxumError>
     where
-        F: FnOnce() -> Result<T, warp::Rejection> + Send + Sync + 'static,
+        F: FnOnce() -> Result<T, AxumError> + Send + Sync + 'static,
         T: Send + 'static,
     {
         if let Some(beacon_processor_send) = &self.beacon_processor_send {
@@ -94,41 +78,33 @@ impl<E: EthSpec> TaskSpawner<E> {
         } else {
             // There is no beacon processor so spawn a task directly on the
             // tokio executor.
-            warp_utils::task::blocking_task(func).await
+            tokio::task::spawn_blocking(func)
+            .await
+            .map_err(|_| AxumError::ServerError("Tokio failed to spawn blocking task".into()))?
         }
     }
 
     /// Executes a "blocking" (non-async) task which returns a `Response`.
     pub async fn blocking_response_task<F, T>(self, priority: Priority, func: F) -> Response
     where
-        F: FnOnce() -> Result<T, warp::Rejection> + Send + Sync + 'static,
-        T: Reply + Send + 'static,
+        F: FnOnce() -> Result<T, AxumError> + Send + Sync + 'static,
+        T: IntoResponse + Send + 'static,
     {
-        let result = self.blocking_task(priority, func).await;
-        convert_rejection(result).await
+        match self.blocking_task(priority, func).await {
+            Ok(response) => response.into_response(),
+            Err(e) => e.into_response(),
+        }
     }
 
     /// Executes a "blocking" (non-async) task which returns a JSON-serializable
     /// object.
     pub async fn blocking_json_task<F, T>(self, priority: Priority, func: F) -> Response
     where
-        F: FnOnce() -> Result<T, warp::Rejection> + Send + Sync + 'static,
+        F: FnOnce() -> Result<T, AxumError> + Send + Sync + 'static,
         T: Serialize + Send + 'static,
     {
-        let func = || func().map(|t| warp::reply::json(&t).into_response());
+        let func = || func().map(|t| Json(t));
         self.blocking_response_task(priority, func).await
-    }
-
-    /// Executes an async task which may return a `Rejection`, which will be converted to a response.
-    pub async fn spawn_async_with_rejection(
-        self,
-        priority: Priority,
-        func: impl Future<Output = Result<Response, warp::Rejection>> + Send + Sync + 'static,
-    ) -> Response {
-        let result = self
-            .spawn_async_with_rejection_no_conversion(priority, func)
-            .await;
-        convert_rejection(result).await
     }
 
     /// Same as `spawn_async_with_rejection` but returning a result with the unhandled rejection.
@@ -138,8 +114,8 @@ impl<E: EthSpec> TaskSpawner<E> {
     pub async fn spawn_async_with_rejection_no_conversion(
         self,
         priority: Priority,
-        func: impl Future<Output = Result<Response, warp::Rejection>> + Send + Sync + 'static,
-    ) -> Result<Response, warp::Rejection> {
+        func: impl Future<Output = Result<Response, AxumError>> + Send + Sync + 'static,
+    ) -> Result<Response, AxumError> {
         if let Some(beacon_processor_send) = &self.beacon_processor_send {
             // Create a wrapper future that will execute `func` and send the
             // result to a channel held by this thread.
@@ -166,10 +142,7 @@ impl<E: EthSpec> TaskSpawner<E> {
             // tokio executor.
             tokio::task::spawn(func)
                 .await
-                .map_err(|_| {
-                    warp_utils::reject::custom_server_error("Tokio failed to spawn task".into())
-                })
-                .and_then(|x| x)
+                .map_err(|_| AxumError::ServerError("Tokio failed to spawn task".into()))?
         }
     }
 }
@@ -183,7 +156,7 @@ async fn send_to_beacon_processor<E: EthSpec, T>(
     priority: Priority,
     process_fn: BlockingOrAsync,
     rx: oneshot::Receiver<T>,
-) -> Result<T, warp::Rejection> {
+) -> Result<T, AxumError> {
     let error_message = match beacon_processor_send.try_send(priority.work_event(process_fn)) {
         Ok(()) => {
             match rx.await {
@@ -198,8 +171,6 @@ async fn send_to_beacon_processor<E: EthSpec, T>(
         Err(TrySendError::Full(_)) => "The task was dropped. The server is overloaded.",
         Err(TrySendError::Closed(_)) => "The task was dropped. The server is shutting down.",
     };
+    Err(AxumError::ServerError(error_message.to_string()))
 
-    Err(warp_utils::reject::custom_server_error(
-        error_message.to_string(),
-    ))
 }

@@ -38,6 +38,7 @@ use types::{
     SyncContributionData, SyncDuty,
 };
 
+use crate::axum_server::error::Error as AxumError;
 use crate::produce_block::get_randao_verification;
 use crate::state_id::StateId;
 use crate::validator::pubkey_to_validator_index;
@@ -737,11 +738,9 @@ pub async fn post_validator_duties_sync<T: BeaconChainTypes>(
     State(ctx): State<Arc<Context<T>>>,
     Path(epoch): Path<Epoch>,
     Json(indices): Json<ValidatorIndexData>,
-) -> Result<Json<api_types::ExecutionOptimisticResponse<Vec<SyncDuty>>>, HandlerError> {
+) -> Result<Json<api_types::ExecutionOptimisticResponse<Vec<SyncDuty>>>, AxumError> {
     let chain = chain_filter(&ctx)?;
     sync_committees::sync_committee_duties(epoch, &indices.0, &chain)
-        .map_err(|e| HandlerError::Other(format!("Validator duties error: {:?}", e)))
-        .map(Json)
 }
 
 async fn produce_block<T: BeaconChainTypes>(

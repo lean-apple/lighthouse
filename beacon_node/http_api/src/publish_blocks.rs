@@ -23,8 +23,13 @@ use types::{
     ExecutionBlockHash, ForkName, FullPayload, FullPayloadBellatrix, Hash256, SignedBeaconBlock,
     SignedBlindedBeaconBlock, VariableList,
 };
-use warp::http::StatusCode;
-use warp::{reply::Response, Rejection, Reply};
+use axum::{
+    extract::State,
+    response::{IntoResponse, Response},
+    Json,
+};
+use http::StatusCode;
+use crate::axum_server::error::Error as AxumError;
 
 pub enum ProvenancedBlock<T: BeaconChainTypes, B: IntoGossipVerifiedBlockContents<T>> {
     /// The payload was built using a local EE.
@@ -53,7 +58,7 @@ pub async fn publish_block<T: BeaconChainTypes, B: IntoGossipVerifiedBlockConten
     log: Logger,
     validation_level: BroadcastValidation,
     duplicate_status_code: StatusCode,
-) -> Result<Response, Rejection> {
+) -> Result<impl IntoResponse, AxumError> {
     let seen_timestamp = timestamp_now();
 
     let (block_contents, is_locally_built_block) = match provenanced_block {
@@ -213,14 +218,14 @@ pub async fn publish_block<T: BeaconChainTypes, B: IntoGossipVerifiedBlockConten
             if let Err(e) = Box::pin(chain.process_gossip_blob(blob)).await {
                 let msg = format!("Invalid blob: {e}");
                 return if let BroadcastValidation::Gossip = validation_level {
-                    Err(warp_utils::reject::broadcast_without_import(msg))
+                    Err(AxumError::BroadcastWithoutImport(msg))
                 } else {
                     error!(
                         log,
                         "Invalid blob provided to HTTP API";
                         "reason" => &msg
                     );
-                    Err(warp_utils::reject::custom_bad_request(msg))
+                    Err(AxumError::BadRequest(msg))
                 };
             }
         }
@@ -263,32 +268,33 @@ pub async fn publish_block<T: BeaconChainTypes, B: IntoGossipVerifiedBlockConten
             if is_locally_built_block {
                 late_block_logging(&chain, seen_timestamp, block.message(), root, "local", &log)
             }
-            Ok(warp::reply().into_response())
+            Ok(StatusCode::OK)
         }
         Ok(AvailabilityProcessingStatus::MissingComponents(_, block_root)) => {
             let msg = format!("Missing parts of block with root {:?}", block_root);
             if let BroadcastValidation::Gossip = validation_level {
-                Err(warp_utils::reject::broadcast_without_import(msg))
+                Err(AxumError::BroadcastWithoutImport(msg))
+
             } else {
                 error!(
                     log,
                     "Invalid block provided to HTTP API";
                     "reason" => &msg
                 );
-                Err(warp_utils::reject::custom_bad_request(msg))
+                Err(AxumError::BadRequest(msg))
             }
         }
         Err(BlockError::BeaconChainError(BeaconChainError::UnableToPublish)) => {
-            Err(warp_utils::reject::custom_server_error(
+            Err(AxumError::ServerError(
                 "unable to publish to network channel".to_string(),
             ))
         }
-        Err(BlockError::Slashable) => Err(warp_utils::reject::custom_bad_request(
+        Err(BlockError::Slashable) => Err(AxumError::BadRequest(
             "proposal for this slot and proposer has already been seen".to_string(),
         )),
         Err(e) => {
             if let BroadcastValidation::Gossip = validation_level {
-                Err(warp_utils::reject::broadcast_without_import(format!("{e}")))
+                Err(AxumError::BroadcastWithoutImport(format!("{e}")))
             } else {
                 let msg = format!("{:?}", e);
                 error!(
@@ -296,7 +302,7 @@ pub async fn publish_block<T: BeaconChainTypes, B: IntoGossipVerifiedBlockConten
                     "Invalid block provided to HTTP API";
                     "reason" => &msg
                 );
-                Err(warp_utils::reject::custom_bad_request(format!(
+                Err(AxumError::BadRequest(format!(
                     "Invalid block: {e}"
                 )))
             }
@@ -313,7 +319,7 @@ pub async fn publish_blinded_block<T: BeaconChainTypes>(
     log: Logger,
     validation_level: BroadcastValidation,
     duplicate_status_code: StatusCode,
-) -> Result<Response, Rejection> {
+) -> Result<impl IntoResponse, AxumError> {
     let block_root = blinded_block.canonical_root();
     let full_block: ProvenancedBlock<T, PublishBlockRequest<T::EthSpec>> =
         reconstruct_block(chain.clone(), block_root, blinded_block, log.clone()).await?;
@@ -337,7 +343,7 @@ pub async fn reconstruct_block<T: BeaconChainTypes>(
     block_root: Hash256,
     block: Arc<SignedBlindedBeaconBlock<T::EthSpec>>,
     log: Logger,
-) -> Result<ProvenancedBlock<T, PublishBlockRequest<T::EthSpec>>, Rejection> {
+) -> Result<ProvenancedBlock<T, PublishBlockRequest<T::EthSpec>>, AxumError> {
     let full_payload_opt = if let Ok(payload_header) = block.message().body().execution_payload() {
         let el = chain.execution_layer.as_ref().ok_or_else(|| {
             warp_utils::reject::custom_server_error("Missing execution layer".to_string())

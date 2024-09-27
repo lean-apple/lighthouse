@@ -4,24 +4,28 @@ use crate::ExecutionOptimistic;
 use beacon_chain::{BeaconChain, BeaconChainTypes};
 use eth2::lighthouse::StandardBlockReward;
 use std::sync::Arc;
-use warp_utils::reject::beacon_chain_error;
+use axum::Json;
+use crate::axum_server::error::Error as AxumError;
+
 /// The difference between block_rewards and beacon_block_rewards is the later returns block
 /// reward format that satisfies beacon-api specs
-pub fn compute_beacon_block_rewards<T: BeaconChainTypes>(
+pub async fn compute_beacon_block_rewards<T: BeaconChainTypes>(
     chain: Arc<BeaconChain<T>>,
     block_id: BlockId,
-) -> Result<(StandardBlockReward, ExecutionOptimistic, bool), warp::Rejection> {
-    let (block, execution_optimistic, finalized) = block_id.blinded_block(&chain)?;
+) -> Result<Json<(StandardBlockReward, ExecutionOptimistic, bool)>, AxumError> {
+    let (block, execution_optimistic, finalized) = block_id.blinded_block(&chain)
+        .map_err(|e| AxumError::BadRequest(format!("Failed to get blinded block: {:?}", e)))?;
 
     let block_ref = block.message();
 
     let block_root = block.canonical_root();
 
-    let mut state = get_state_before_applying_block(chain.clone(), &block)?;
+    let mut state = get_state_before_applying_block(chain.clone(), &block)
+        .map_err(|e| AxumError::ServerError(format!("Failed to get state before applying block: {:?}", e)))?;
 
     let rewards = chain
         .compute_beacon_block_reward(block_ref, block_root, &mut state)
-        .map_err(beacon_chain_error)?;
+        .map_err(|e| AxumError::ServerError(format!("Failed to compute beacon block reward: {:?}", e)))?;
 
-    Ok((rewards, execution_optimistic, finalized))
+    Ok(Json((rewards, execution_optimistic, finalized)))
 }

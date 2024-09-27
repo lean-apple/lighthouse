@@ -1,6 +1,8 @@
 //! Contains the handler for the `GET validator/duties/proposer/{epoch}` endpoint.
 
+use crate::axum_server::error::Error as AxumError;
 use crate::state_id::StateId;
+use axum::Json;
 use beacon_chain::{
     beacon_proposer_cache::{compute_proposer_duties_from_head, ensure_state_is_in_epoch},
     BeaconChain, BeaconChainError, BeaconChainTypes,
@@ -20,7 +22,7 @@ pub fn proposer_duties<T: BeaconChainTypes>(
     request_epoch: Epoch,
     chain: &BeaconChain<T>,
     log: &Logger,
-) -> Result<ApiDuties, warp::reject::Rejection> {
+) -> Result<Json<ApiDuties>, AxumError> {
     let current_epoch = chain
         .epoch()
         .map_err(warp_utils::reject::beacon_chain_error)?;
@@ -93,7 +95,7 @@ pub fn proposer_duties<T: BeaconChainTypes>(
 fn try_proposer_duties_from_cache<T: BeaconChainTypes>(
     request_epoch: Epoch,
     chain: &BeaconChain<T>,
-) -> Result<Option<ApiDuties>, warp::reject::Rejection> {
+) -> Result<Option<ApiDuties>, AxumError> {
     let head = chain.canonical_head.cached_head();
     let head_block = &head.snapshot.beacon_block;
     let head_block_root = head.head_block_root();
@@ -151,7 +153,7 @@ fn try_proposer_duties_from_cache<T: BeaconChainTypes>(
 fn compute_and_cache_proposer_duties<T: BeaconChainTypes>(
     current_epoch: Epoch,
     chain: &BeaconChain<T>,
-) -> Result<ApiDuties, warp::reject::Rejection> {
+) -> Result<ApiDuties, AxumError> {
     let (indices, dependent_root, execution_status, fork) =
         compute_proposer_duties_from_head(current_epoch, chain)
             .map_err(warp_utils::reject::beacon_chain_error)?;
@@ -178,7 +180,7 @@ fn compute_and_cache_proposer_duties<T: BeaconChainTypes>(
 fn compute_historic_proposer_duties<T: BeaconChainTypes>(
     epoch: Epoch,
     chain: &BeaconChain<T>,
-) -> Result<ApiDuties, warp::reject::Rejection> {
+) -> Result<ApiDuties, AxumError> {
     // If the head is quite old then it might still be relevant for a historical request.
     //
     // Avoid holding the `cached_head` longer than necessary.
@@ -245,7 +247,7 @@ fn convert_to_api_response<T: BeaconChainTypes>(
     dependent_root: Hash256,
     execution_optimistic: bool,
     indices: Vec<usize>,
-) -> Result<ApiDuties, warp::reject::Rejection> {
+) -> Result<ApiDuties, AxumError> {
     let index_to_pubkey_map = chain
         .validator_pubkey_bytes_many(&indices)
         .map_err(warp_utils::reject::beacon_chain_error)?;

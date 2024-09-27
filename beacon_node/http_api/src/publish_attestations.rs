@@ -34,6 +34,8 @@
 //! is invalid, but since a valid attestation already it exists it
 //! appears that this validator is capable of producing valid
 //! attestations and there's no immediate cause for concern.
+//!
+use crate::axum_server::error::Error as AxumError;
 use crate::task_spawner::{Priority, TaskSpawner};
 use beacon_chain::{
     validator_monitor::timestamp_now, AttestationError, BeaconChain, BeaconChainError,
@@ -136,7 +138,7 @@ pub async fn publish_attestations<T: BeaconChainTypes>(
     network_tx: UnboundedSender<NetworkMessage<T::EthSpec>>,
     reprocess_send: Option<Sender<ReprocessQueueMessage>>,
     log: Logger,
-) -> Result<(), warp::Rejection> {
+) -> Result<(), AxumError> {
     // Collect metadata about attestations which we'll use to report failures. We need to
     // move the `attestations` vec into the blocking task, so this small overhead is unavoidable.
     let attestation_metadata = attestations
@@ -311,9 +313,9 @@ pub async fn publish_attestations<T: BeaconChainTypes>(
     if failures.is_empty() {
         Ok(())
     } else {
-        Err(warp_utils::reject::indexed_bad_request(
-            "error processing attestations".to_string(),
-            failures,
-        ))
+        Err(AxumError::BadRequest(format!(
+            "Error processing attestations: {:?}",
+            failures
+        )))
     }
 }

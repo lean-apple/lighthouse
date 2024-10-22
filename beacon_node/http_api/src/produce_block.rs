@@ -3,7 +3,7 @@ use crate::{
     version::{
         add_consensus_block_value_header, add_consensus_version_header,
         add_execution_payload_blinded_header, add_execution_payload_value_header,
-        add_ssz_content_type_header, fork_versioned_response, inconsistent_fork_rejection,
+        add_ssz_content_type_header, fork_versioned_response,
     },
 };
 use beacon_chain::{
@@ -16,10 +16,10 @@ use ssz::Encode;
 use std::sync::Arc;
 use types::{payload::BlockProductionVersion, *};
 use axum::{
-    extract::{Query, State},
+    body::Body,
+    extract::{Query, State, Path},
     response::{IntoResponse, Response},
-    http::{HeaderMap, StatusCode},
-    Json,
+    http::{StatusCode, header::CONTENT_TYPE},
 };
 use crate::axum_server::error::Error as AxumError;
 
@@ -46,10 +46,10 @@ pub fn get_randao_verification(
 }
 
 pub async fn produce_block_v3<T: BeaconChainTypes>(
+    State(chain): State<Arc<BeaconChain<T>>>,
+    Path(slot): Path<Slot>,
+    Query(query): Query<api_types::ValidatorBlocksQuery>,
     accept_header: Option<api_types::Accept>,
-    chain: Arc<BeaconChain<T>>,
-    slot: Slot,
-    query: api_types::ValidatorBlocksQuery,
 ) -> Result<impl IntoResponse, AxumError> {
     let randao_reveal = query.randao_reveal.decompress().map_err(|e| {
         AxumError::BadRequest(format!(
@@ -84,7 +84,7 @@ pub fn build_response_v3<T: BeaconChainTypes>(
     chain: Arc<BeaconChain<T>>,
     block_response: BeaconBlockResponseWrapper<T::EthSpec>,
     accept_header: Option<api_types::Accept>,
-) -> Result<impl IntoResponse, AxumError> {
+) -> Result<Response<Body>, AxumError> {
     let fork_name = block_response
         .fork_name(&chain.spec)
         .map_err(|e| AxumError::ServerError(format!("Inconsistent fork: {:?}", e)))?;
@@ -101,35 +101,37 @@ pub fn build_response_v3<T: BeaconChainTypes>(
 
     let block_contents = build_block_contents::build_block_contents(fork_name, block_response)?;
 
-    let mut headers = HeaderMap::new();
-    headers.insert("Eth-Consensus-Version", fork_name.to_string().parse().unwrap());
-    headers.insert("Eth-Execution-Payload-Blinded", execution_payload_blinded.to_string().parse().unwrap());
-    headers.insert("Eth-Execution-Payload-Value", execution_payload_value.to_string().parse().unwrap());
-    headers.insert("Eth-Consensus-Block-Value", consensus_block_value.to_string().parse().unwrap());
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .body(Body::empty())
+        .unwrap();
+
+    response = add_consensus_version_header(response, fork_name)?;
+    response = add_execution_payload_blinded_header(response, execution_payload_blinded)?;
+    response = add_execution_payload_value_header(response, execution_payload_value)?;
+    response = add_consensus_block_value_header(response, consensus_block_value)?;
 
     match accept_header {
         Some(api_types::Accept::Ssz) => {
-            headers.insert(header::CONTENT_TYPE, "application/octet-stream".parse().unwrap());
-            Ok((StatusCode::OK, headers, block_contents.as_ssz_bytes()))
+            response = add_ssz_content_type_header(response);
+            *response.body_mut() = Body::from(block_contents.as_ssz_bytes());
+            Ok(response)
         },
         _ => {
-            headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
-            let response = ForkVersionedResponse {
-                version: Some(fork_name),
-                metadata,
-                data: block_contents,
-            };
-            Ok((StatusCode::OK, headers, Json(response)))
+            response.headers_mut().insert(CONTENT_TYPE, "application/json".parse().unwrap());
+            let json_response = fork_versioned_response(EndpointVersion::V3, fork_name, block_contents)?;
+            *response.body_mut() = Body::from(serde_json::to_vec(&json_response)?);
+            Ok(response)
         }
     }
 }
-
 
 pub async fn produce_blinded_block_v2<T: BeaconChainTypes>(
     State(chain): State<Arc<BeaconChain<T>>>,
     Query(query): Query<api_types::ValidatorBlocksQuery>,
     Path(slot): Path<Slot>,
     endpoint_version: EndpointVersion,
+    accept_header: Option<api_types::Accept>,
 ) -> Result<impl IntoResponse, AxumError> {
     let randao_reveal = query.randao_reveal.decompress().map_err(|e| {
         AxumError::BadRequest(format!(
@@ -151,18 +153,18 @@ pub async fn produce_blinded_block_v2<T: BeaconChainTypes>(
         .await
         .map_err(|e| AxumError::ServerError(format!("Block production error: {:?}", e)))?;
 
-    build_response_v2(chain, block_response_type, endpoint_version)
+    build_response_v2(chain, block_response_type, endpoint_version, accept_header)
 }
 
 pub async fn produce_block_v2<T: BeaconChainTypes>(
+    State(chain): State<Arc<BeaconChain<T>>>,
+    Query(query): Query<api_types::ValidatorBlocksQuery>,
+    Path(slot): Path<Slot>,
     endpoint_version: EndpointVersion,
     accept_header: Option<api_types::Accept>,
-    chain: Arc<BeaconChain<T>>,
-    slot: Slot,
-    query: api_types::ValidatorBlocksQuery,
-) -> Result<Response<Body>, warp::Rejection> {
+) -> Result<impl IntoResponse, AxumError> {
     let randao_reveal = query.randao_reveal.decompress().map_err(|e| {
-        warp_utils::reject::custom_bad_request(format!(
+        AxumError::BadRequest(format!(
             "randao reveal is not a valid BLS signature: {:?}",
             e
         ))
@@ -180,7 +182,7 @@ pub async fn produce_block_v2<T: BeaconChainTypes>(
             BlockProductionVersion::FullV2,
         )
         .await
-        .map_err(warp_utils::reject::block_production_error)?;
+        .map_err(|e| AxumError::BlockProductionError(format!("Block production error: {:?}", e)))?;
 
     build_response_v2(chain, block_response_type, endpoint_version, accept_header)
 }
@@ -189,17 +191,32 @@ pub fn build_response_v2<T: BeaconChainTypes>(
     chain: Arc<BeaconChain<T>>,
     block_response: BeaconBlockResponseWrapper<T::EthSpec>,
     endpoint_version: EndpointVersion,
-) -> Result<impl IntoResponse, AxumError> {
+    accept_header: Option<api_types::Accept>,
+) -> Result<Response<Body>, AxumError> {
     let fork_name = block_response
         .fork_name(&chain.spec)
         .map_err(|e| AxumError::ServerError(format!("Inconsistent fork: {:?}", e)))?;
 
     let block_contents = build_block_contents::build_block_contents(fork_name, block_response)?;
 
-    let mut headers = HeaderMap::new();
-    headers.insert("Eth-Consensus-Version", fork_name.to_string().parse().unwrap());
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .body(Body::empty())
+        .unwrap();
 
-    let response = fork_versioned_response(endpoint_version, fork_name, block_contents)?;
+    response = add_consensus_version_header(response, fork_name)?;
 
-    Ok((StatusCode::OK, headers, Json(response)))
+    match accept_header {
+        Some(api_types::Accept::Ssz) => {
+            response = add_ssz_content_type_header(response);
+            *response.body_mut() = Body::from(block_contents.as_ssz_bytes());
+            Ok(response)
+        }
+        _ => {
+            response.headers_mut().insert(CONTENT_TYPE, "application/json".parse().unwrap());
+            let json_response = fork_versioned_response(endpoint_version, fork_name, block_contents)?;
+            *response.body_mut() = Body::from(serde_json::to_vec(&json_response)?);
+            Ok(response)
+        }
+    }
 }

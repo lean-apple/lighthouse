@@ -92,12 +92,12 @@ use version::{
     execution_optimistic_finalized_fork_versioned_response, inconsistent_fork_rejection,
     unsupported_version_rejection, V1, V2, V3,
 };
-use warp::http::StatusCode;
-use warp::hyper::Body;
-use warp::sse::Event;
-use warp::Reply;
-use warp::{http::Response, Filter, Rejection};
-use warp_utils::{query::multi_key_query, uor::UnifyingOrFilter};
+// use warp::http::StatusCode;
+// use warp::hyper::Body;
+// use warp::sse::Event;
+// use warp::Reply;
+// use warp::{http::Response, Filter, Rejection};
+// use warp_utils::{query::multi_key_query, uor::UnifyingOrFilter};
 use crate::axum_server::error::Error as AxumError;
 
 const API_PREFIX: &str = "eth";

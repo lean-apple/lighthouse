@@ -1,5 +1,7 @@
 use crate::metrics;
 
+use crate::axum_server::error::Error as AxumError;
+use axum::{http::StatusCode, response::IntoResponse};
 use beacon_chain::block_verification_types::{AsBlock, BlockContentsError};
 use beacon_chain::validator_monitor::{get_block_delay_ms, timestamp_now};
 use beacon_chain::{
@@ -23,13 +25,6 @@ use types::{
     ExecutionBlockHash, ForkName, FullPayload, FullPayloadBellatrix, Hash256, SignedBeaconBlock,
     SignedBlindedBeaconBlock, VariableList,
 };
-use axum::{
-    extract::State,
-    response::{IntoResponse, Response},
-    Json,
-};
-use http::StatusCode;
-use crate::axum_server::error::Error as AxumError;
 
 pub enum ProvenancedBlock<T: BeaconChainTypes, B: IntoGossipVerifiedBlockContents<T>> {
     /// The payload was built using a local EE.
@@ -107,17 +102,18 @@ pub async fn publish_block<T: BeaconChainTypes, B: IntoGossipVerifiedBlockConten
                     .map_err(|_| BlockError::BeaconChainError(BeaconChainError::UnableToPublish))?;
             }
             SignedBeaconBlock::Deneb(_) | SignedBeaconBlock::Electra(_) => {
-                let mut pubsub_messages = vec![PubsubMessage::BeaconBlock(block)];
+                crate::publish_pubsub_message(&sender, PubsubMessage::BeaconBlock(block))
+                    .map_err(|_| BlockError::BeaconChainError(BeaconChainError::UnableToPublish))?;
+    
                 if let Some(blob_sidecars) = blobs_opt {
                     for (blob_index, blob) in blob_sidecars.into_iter().enumerate() {
-                        pubsub_messages.push(PubsubMessage::BlobSidecar(Box::new((
-                            blob_index as u64,
-                            blob,
-                        ))));
+                        crate::publish_pubsub_message(
+                            &sender,
+                            PubsubMessage::BlobSidecar(Box::new((blob_index as u64, blob))),
+                        )
+                        .map_err(|_| BlockError::BeaconChainError(BeaconChainError::UnableToPublish))?;
                     }
                 }
-                crate::publish_pubsub_messages(&sender, pubsub_messages)
-                    .map_err(|_| BlockError::BeaconChainError(BeaconChainError::UnableToPublish))?;
             }
         };
         Ok(())
@@ -139,15 +135,14 @@ pub async fn publish_block<T: BeaconChainTypes, B: IntoGossipVerifiedBlockConten
                 beacon_chain::blob_verification::GossipBlobError::RepeatBlob { .. },
             )) => {
                 // Allow the status code for duplicate blocks to be overridden based on config.
-                return Ok(warp::reply::with_status(
-                    warp::reply::json(&ErrorMessage {
+                return Ok((
+                    duplicate_status_code,
+                    axum::Json(ErrorMessage {
                         code: duplicate_status_code.as_u16(),
                         message: "duplicate block".to_string(),
                         stacktraces: vec![],
-                    }),
-                    duplicate_status_code,
-                )
-                .into_response());
+                    })
+                ).into_response());
             }
             Err(e) => {
                 warn!(
@@ -156,7 +151,7 @@ pub async fn publish_block<T: BeaconChainTypes, B: IntoGossipVerifiedBlockConten
                     "slot" => slot,
                     "error" => %e
                 );
-                return Err(warp_utils::reject::custom_bad_request(e.to_string()));
+                return Err(AxumError::BadRequest(e.to_string()));
             }
         };
 
@@ -181,7 +176,7 @@ pub async fn publish_block<T: BeaconChainTypes, B: IntoGossipVerifiedBlockConten
             log.clone(),
             seen_timestamp,
         )
-        .map_err(|_| warp_utils::reject::custom_server_error("unable to publish".into()))?;
+        .map_err(|_| AxumError::ServerError("unable to publish".into()))?;
     }
 
     let block_clone = block.clone();
@@ -268,13 +263,12 @@ pub async fn publish_block<T: BeaconChainTypes, B: IntoGossipVerifiedBlockConten
             if is_locally_built_block {
                 late_block_logging(&chain, seen_timestamp, block.message(), root, "local", &log)
             }
-            Ok(StatusCode::OK)
+            Ok(StatusCode::OK.into_response())
         }
         Ok(AvailabilityProcessingStatus::MissingComponents(_, block_root)) => {
             let msg = format!("Missing parts of block with root {:?}", block_root);
             if let BroadcastValidation::Gossip = validation_level {
                 Err(AxumError::BroadcastWithoutImport(msg))
-
             } else {
                 error!(
                     log,
@@ -284,11 +278,9 @@ pub async fn publish_block<T: BeaconChainTypes, B: IntoGossipVerifiedBlockConten
                 Err(AxumError::BadRequest(msg))
             }
         }
-        Err(BlockError::BeaconChainError(BeaconChainError::UnableToPublish)) => {
-            Err(AxumError::ServerError(
-                "unable to publish to network channel".to_string(),
-            ))
-        }
+        Err(BlockError::BeaconChainError(BeaconChainError::UnableToPublish)) => Err(
+            AxumError::ServerError("unable to publish to network channel".to_string()),
+        ),
         Err(BlockError::Slashable) => Err(AxumError::BadRequest(
             "proposal for this slot and proposer has already been seen".to_string(),
         )),
@@ -302,9 +294,7 @@ pub async fn publish_block<T: BeaconChainTypes, B: IntoGossipVerifiedBlockConten
                     "Invalid block provided to HTTP API";
                     "reason" => &msg
                 );
-                Err(AxumError::BadRequest(format!(
-                    "Invalid block: {e}"
-                )))
+                Err(AxumError::BadRequest(format!("Invalid block: {e}")))
             }
         }
     }
@@ -346,7 +336,7 @@ pub async fn reconstruct_block<T: BeaconChainTypes>(
 ) -> Result<ProvenancedBlock<T, PublishBlockRequest<T::EthSpec>>, AxumError> {
     let full_payload_opt = if let Ok(payload_header) = block.message().body().execution_payload() {
         let el = chain.execution_layer.as_ref().ok_or_else(|| {
-            warp_utils::reject::custom_server_error("Missing execution layer".to_string())
+            AxumError::ServerError("Missing execution layer".to_string())
         })?;
 
         // If the execution block hash is zero, use an empty payload.
@@ -358,8 +348,9 @@ pub async fn reconstruct_block<T: BeaconChainTypes>(
                 let payload: FullPayload<T::EthSpec> = FullPayloadBellatrix::default().into();
                 ProvenancedPayload::Local(FullPayloadContents::Payload(payload.into()))
             } else {
-                Err(warp_utils::reject::custom_server_error(
-                    "Failed to construct full payload - block hash must be non-zero after Bellatrix.".to_string()
+                Err(AxumError::ServerError(
+                    "Failed to construct full payload - block hash must be non-zero after Bellatrix."
+                        .to_string(),
                 ))?
             }
         // If we already have an execution payload with this transactions root cached, use it.
@@ -388,10 +379,7 @@ pub async fn reconstruct_block<T: BeaconChainTypes>(
                 .propose_blinded_beacon_block(block_root, &block)
                 .await
                 .map_err(|e| {
-                    warp_utils::reject::custom_server_error(format!(
-                        "Blind block proposal failed: {:?}",
-                        e
-                    ))
+                    AxumError::ServerError(format!("Blind block proposal failed: {:?}", e))
                 })?;
             info!(log, "Successfully published a block to the builder network"; "block_hash" => ?full_payload.block_hash());
             ProvenancedPayload::Builder(full_payload)
@@ -419,9 +407,10 @@ pub async fn reconstruct_block<T: BeaconChainTypes>(
                 .map(ProvenancedBlock::builder)
         }
     }
-    .map_err(|e| {
-        warp_utils::reject::custom_server_error(format!("Unable to add payload to block: {e:?}"))
-    })
+    .map_err(|e| 
+        AxumError::ServerError(format!("Unable to add payload to block: {e:?}"))
+    )
+    
 }
 
 /// If the `seen_timestamp` is some time after the start of the slot for

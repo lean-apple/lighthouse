@@ -728,9 +728,9 @@ pub async fn get_validator_duties_proposer<T: BeaconChainTypes>(
 ) -> Result<Json<api_types::DutiesResponse<Vec<api_types::ProposerData>>>, HandlerError> {
     let chain = chain_filter(&ctx)?;
     let log = ctx.log.clone();
-    proposer_duties::proposer_duties(epoch, &chain, &log)
+    proposer_duties::proposer_duties
+    (epoch, &chain, &log)
         .map_err(|e| HandlerError::Other(format!("Proposer duties error: {:?}", e)))
-        .map(Json)
 }
 
 /// POST validator/duties/sync/{epoch}
